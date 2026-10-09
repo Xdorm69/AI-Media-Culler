@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from media_culler.config import ThresholdsConfig
-from media_culler.models import GroupRole, ImageRecord, Recommendation
+from media_culler.models import GroupRole, ImageRecord, Recommendation, SceneType
 
 
 def _scored(records: list[ImageRecord]) -> list[ImageRecord]:
@@ -23,6 +23,20 @@ def rank_collection(records: list[ImageRecord]) -> None:
         record.collection_percentile = round((total - index) / total * 100, 2)
 
 
+def _soft_focus_landscape(record: ImageRecord, thresholds: ThresholdsConfig) -> bool:
+    """Landscape whose (tiled) sharpness sub-score is below the gate.
+
+    Landscape-only on purpose: a portrait with creamy bokeh has low *global* sharpness
+    while its face is crisp, so the same rule would wrongly demote it.
+    """
+    scores = record.scores
+    if scores is None or scores.scene_type is not SceneType.LANDSCAPE:
+        return False
+    technical = scores.details.get("technical")
+    sharpness = technical.get("sharpness") if isinstance(technical, dict) else None
+    return sharpness is not None and sharpness < thresholds.soft_focus_sharpness
+
+
 def classify(record: ImageRecord, thresholds: ThresholdsConfig) -> tuple[Recommendation, str]:
     final = record.final_score
     technical = record.scores.technical if record.scores else None
@@ -30,6 +44,8 @@ def classify(record: ImageRecord, thresholds: ThresholdsConfig) -> tuple[Recomme
         return Recommendation.UNSCORED, "Analysis incomplete; no score available"
     if technical < thresholds.technical_floor:
         return Recommendation.REJECT, "Very low technical quality"
+    if _soft_focus_landscape(record, thresholds) and final >= thresholds.review:
+        return Recommendation.REVIEW, "Landscape is soft/out of focus; check before keeping"
     if final >= thresholds.select:
         return Recommendation.SELECT, "High overall photographic score"
     if final >= thresholds.usable:

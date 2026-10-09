@@ -16,6 +16,12 @@ class Recommendation(str, Enum):
     UNSCORED = "unscored"
 
 
+class SceneType(str, Enum):
+    PEOPLE = "people"
+    LANDSCAPE = "landscape"
+    GENERAL = "general"
+
+
 class GroupRole(str, Enum):
     UNIQUE = "unique"
     REPRESENTATIVE = "representative"
@@ -76,6 +82,26 @@ class FaceAnalysis(BaseModel):
     faces: list[FaceInfo] = Field(default_factory=list)
 
 
+class HorizonInfo(BaseModel):
+    """A dominant near-horizontal line (sea/sky/ground boundary)."""
+
+    angle_deg: float  # signed tilt; 0 = level. Positive = right side lower (clockwise)
+    y: float  # vertical position, 0 = top edge, 1 = bottom edge
+    confidence: float  # 0-1: how much of the frame width the line spans, and how consistent it is
+
+
+class SceneMetrics(BaseModel):
+    """Scene-level measurements used by landscape-aware scoring."""
+
+    horizon: HorizonInfo | None = None
+    highlight_clip: float  # fraction of pixels with any channel >= 250
+    shadow_clip: float  # fraction of pixels with every channel <= 5
+    dynamic_range: float  # 99th - 1st luminance percentile (0-255)
+    sharpness_focus: float  # 75th-percentile tile Laplacian variance (ignores smooth sky/water)
+    saliency_x: float  # centroid of the most salient region, 0-1 from the left
+    saliency_y: float
+
+
 # ------------------------------------------------------------------------- scores
 
 
@@ -85,6 +111,7 @@ class Scores(BaseModel):
     subject: float | None = None
     composition: float | None = None
     final: float | None = None
+    scene_type: SceneType | None = None
     # Normalised weights actually applied (components that were unavailable are absent).
     weights_used: dict[str, float] = Field(default_factory=dict)
     details: dict[str, Any] = Field(default_factory=dict)
@@ -111,6 +138,7 @@ class ImageRecord(BaseModel):
     technical: TechnicalMetrics | None = None
     ai: AIAssessment | None = None
     faces: FaceAnalysis | None = None
+    scene: SceneMetrics | None = None
     analyzer_errors: dict[str, str] = Field(default_factory=dict)
 
     scores: Scores | None = None

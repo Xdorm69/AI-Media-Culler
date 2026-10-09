@@ -52,3 +52,35 @@ def photo_dir(tmp_path: Path) -> Path:
     (root / "corrupt.jpg").write_bytes(b"\xff\xd8\xff\xe0 definitely not a jpeg")
     (root / "notes.txt").write_text("not an image")
     return root
+
+
+def landscape_image(
+    width: int = 1200,
+    height: int = 800,
+    horizon: float = 0.4,
+    tilt: float = 0.0,
+    seed: int = 0,
+    detail: int = 8,
+) -> np.ndarray:
+    """Synthetic scenery: smooth gradient sky over textured ground, optionally rotated.
+
+    ``detail`` is the ground texture cell size in pixels (2 = fine, genuinely sharp detail).
+    ``tilt`` follows cv2.getRotationMatrix2D (positive = counter-clockwise), so a positive
+    tilt here is detected as a *negative* horizon angle (right side higher).
+    """
+    rng = np.random.default_rng(seed)
+    rows = np.linspace(0, 1, height)[:, None]
+    sky = np.stack([120 + 80 * rows, 170 + 50 * rows, 235 - 10 * rows], -1) * np.ones((1, width, 1))
+    ground = cv2.resize(
+        rng.integers(20, 120, (height // detail, width // detail, 3), dtype=np.uint8),
+        (width, height),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    ground = (ground * np.array([0.5, 1.0, 0.4])).astype(np.uint8)
+    image = sky.astype(np.uint8)
+    split = int(height * horizon)
+    image[split:] = ground[split:]
+    if tilt:
+        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), tilt, 1.0)
+        image = cv2.warpAffine(image, matrix, (width, height), borderMode=cv2.BORDER_REPLICATE)
+    return image

@@ -25,6 +25,8 @@ AESTHETIC_LABELS = [
     "an ordinary photograph",
 ]
 
+LANDSCAPE_LABEL = CONTENT_LABELS[1]
+
 # Order matters: it defines how a flat score vector is split back into groups.
 LABEL_GROUPS: dict[str, list[str]] = {
     "content": CONTENT_LABELS,

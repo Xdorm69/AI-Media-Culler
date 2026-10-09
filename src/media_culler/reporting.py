@@ -10,14 +10,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from media_culler import __version__
 from media_culler.exceptions import ReportError
 from media_culler.models import GroupRole, ImageRecord, Recommendation
 from media_culler.pipeline import RunResult
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+_READABLE_SCHEMAS = {2, 3}  # v3 only adds fields; v2 reports load with defaults
 
 
 class TopImage(BaseModel):
@@ -39,6 +40,7 @@ class Summary(BaseModel):
     mean_score: float | None
     median_score: float | None
     analyzer_failures: dict[str, int]
+    scene_counts: dict[str, int] = Field(default_factory=dict)
     top: list[TopImage]
 
 
@@ -71,6 +73,12 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int 
         for name in record.analyzer_errors:
             failures[name] = failures.get(name, 0) + 1
 
+    scenes: dict[str, int] = {}
+    for record in valid:
+        if record.scores and record.scores.scene_type:
+            key = record.scores.scene_type.value
+            scenes[key] = scenes.get(key, 0) + 1
+
     values = [r.final_score for r in scored if r.final_score is not None]
     return Summary(
         total_files=len(records),
@@ -84,6 +92,7 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int 
         mean_score=round(statistics.fmean(values), 2) if values else None,
         median_score=round(statistics.median(values), 2) if values else None,
         analyzer_failures=failures,
+        scene_counts=dict(sorted(scenes.items())),
         top=[
             TopImage(
                 filename=r.filename,
@@ -137,6 +146,7 @@ CSV_COLUMNS = [
     "filename",
     "relative_path",
     "recommendation",
+    "scene",
     "final_score",
     "technical",
     "ai",
@@ -161,6 +171,7 @@ def _csv_row(r: ImageRecord) -> dict[str, Any]:
         "filename": r.filename,
         "relative_path": r.relative_path,
         "recommendation": r.recommendation.value if r.recommendation else "",
+        "scene": s.scene_type.value if s and s.scene_type else "",
         "final_score": s.final if s else None,
         "technical": s.technical if s else None,
         "ai": s.ai if s else None,
@@ -214,7 +225,7 @@ def load_report(path: Path) -> Report:
             f"{path} is a v0.1 report (bare list). "
             f"Re-run `culler run` to produce a v{SCHEMA_VERSION} report."
         )
-    if data.get("schema_version") != SCHEMA_VERSION:
+    if data.get("schema_version") not in _READABLE_SCHEMAS:
         raise ReportError(
             f"Unsupported report schema {data.get('schema_version')!r} (expected {SCHEMA_VERSION})."
         )

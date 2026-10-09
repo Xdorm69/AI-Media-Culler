@@ -163,6 +163,9 @@ def print_results(
             table = top_table(report)
             if table:
                 console.print(table)
+    if report.summary.scene_counts:
+        mix = " · ".join(f"{n} {name}" for name, n in report.summary.scene_counts.items())
+        console.print(f"[muted]scenes: {mix}[/]")
     notes = notes_panel(report)
     if notes:
         console.print(notes)

@@ -81,6 +81,9 @@ class ThresholdsConfig(_Section):
     review: float = Field(45, ge=0, le=100)
     # Images whose technical score is below this are rejected regardless of other scores.
     technical_floor: float = Field(25, ge=0, le=100)
+    # Landscapes whose sharpness sub-score (0-100) is below this are capped at "review", however
+    # well composed: a level horizon must not rescue an out-of-focus frame. 0 disables the gate.
+    soft_focus_sharpness: float = Field(12, ge=0, le=100)
 
     @model_validator(mode="after")
     def _ordered(self) -> ThresholdsConfig:
@@ -134,6 +137,22 @@ class FacesConfig(_Section):
     max_side: int = Field(1920, ge=256)
 
 
+class SceneConfig(_Section):
+    """Landscape-aware scoring."""
+
+    enabled: bool = True
+    # Minimum AI confidence (0-100) for the top content label to count as "landscape".
+    # SigLIP probabilities are uncalibrated, so the default is "top label wins".
+    landscape_min_confidence: float = Field(0.0, ge=0, le=100)
+    # A face covering at least this fraction of the frame makes the photo "people", not landscape.
+    people_min_face_area: float = Field(0.01, ge=0, le=1)
+    # Horizon lines below this confidence are ignored when scoring composition.
+    horizon_min_confidence: float = Field(0.35, ge=0, le=1)
+    # Without AI, a very confident horizon and no real faces is treated as a landscape.
+    heuristic_without_ai: bool = True
+    heuristic_horizon_confidence: float = Field(0.6, ge=0, le=1)
+
+
 class PerformanceConfig(_Section):
     # Worker threads for scanning/hashing and for decode + OpenCV analysis prefetch.
     workers: int = Field(4, ge=1, le=64)
@@ -148,6 +167,7 @@ class Settings(_Section):
     duplicates: DuplicatesConfig = DuplicatesConfig()
     vision: VisionConfig = VisionConfig()
     faces: FacesConfig = FacesConfig()
+    scene: SceneConfig = SceneConfig()
     performance: PerformanceConfig = PerformanceConfig()
 
     @property
@@ -268,6 +288,7 @@ thresholds:                         # final score (0-100) cut-offs
   usable: 65
   review: 45
   technical_floor: 25               # below this technical score => always reject_candidate
+  soft_focus_sharpness: 12          # landscapes softer than this sub-score are capped at review
 
 weights:                            # relative; normalised over available components
   technical: 0.40
@@ -293,6 +314,14 @@ faces:                              # needs: pip install 'ai-media-culler[faces]
   model_filename: face_landmarker.task
   model_sha256: null                # optional integrity check for `culler models download`
   max_side: 1920
+
+scene:                              # landscape-aware scoring
+  enabled: true
+  landscape_min_confidence: 0.0     # AI confidence (0-100) needed to call a photo a landscape
+  people_min_face_area: 0.01        # faces larger than this fraction of the frame => "people"
+  horizon_min_confidence: 0.35      # ignore weaker horizon detections
+  heuristic_without_ai: true        # guess "landscape" from a strong horizon when AI is off
+  heuristic_horizon_confidence: 0.6
 
 performance:
   workers: 4
