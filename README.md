@@ -47,6 +47,7 @@ Useful `run` flags: `--no-ai`, `--no-faces`, `--no-duplicates`, `--no-cache`, `-
 `--strict` (fail instead of skipping an unavailable analyzer), `--download-models`.
 
 Exit codes: `0` ok · `1` runtime error · `2` bad usage/config · `130` interrupted
+
 (finished analyses are cached, so re-running resumes).
 
 ## Architecture

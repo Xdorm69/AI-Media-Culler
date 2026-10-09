@@ -19,12 +19,28 @@ dependencies = [
     "typer>=0.12",
 ]
 
+
 [project.optional-dependencies]
 # Semantic photo assessment (SigLIP zero-shot)
-ai = ["torch>=2.2", "transformers>=4.40"]
+ai = [
+    "torch>=2.2",
+    "transformers>=4.40",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25.3",
+]
+
 # Face / eye / pose analysis (MediaPipe Face Landmarker)
 faces = ["mediapipe>=0.10.14"]
-all = ["ai-media-culler[ai,faces]"]
+
+# HEIC/HEIF and camera RAW image decoding
+formats = [
+    "pillow-heif>=0.16.0",
+    "rawpy>=0.19.0",
+]
+
+# Everything needed for the full application
+all = ["ai-media-culler[ai,faces,formats]"]
+
 dev = [
     "pytest>=8",
     "pytest-cov>=5",

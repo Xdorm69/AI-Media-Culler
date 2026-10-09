@@ -14,9 +14,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pillow_heif
 from PIL import Image, ImageOps
 
 from media_culler.exceptions import ImageLoadError
+
+pillow_heif.register_heif_opener()
 
 EXIF_ORIENTATION = 0x0112
 _SWAPPED_ORIENTATIONS = {5, 6, 7, 8}

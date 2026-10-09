@@ -38,7 +38,29 @@ class PathsConfig(_Section):
 
 
 class ScanConfig(_Section):
-    extensions: list[str] = [".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"]
+    extensions: list[str] = [
+        ".bmp",
+        ".jpeg",
+        ".jpg",
+        ".png",
+        ".tif",
+        ".tiff",
+        ".webp",
+        # HEIC / HEIF
+        ".heic",
+        ".heif",
+        # Camera RAW
+        ".dng",
+        ".cr2",
+        ".cr3",
+        ".nef",
+        ".arw",
+        ".orf",
+        ".rw2",
+        ".raf",
+        ".pef",
+        ".srw",
+    ]
     recursive: bool = True
     follow_symlinks: bool = False
     exclude_dirs: list[str] = [".git", "__pycache__", ".culler_cache"]
@@ -218,7 +240,26 @@ paths:
   models_directory: models
 
 scan:
-  extensions: [.jpg, .jpeg, .png, .webp, .bmp, .tiff, .tif]
+  extensions:
+    - .jpg
+    - .jpeg
+    - .png
+    - .webp
+    - .bmp
+    - .tiff
+    - .tif
+    - .heic
+    - .heif
+    - .dng
+    - .cr2
+    - .cr3
+    - .nef
+    - .arw
+    - .orf
+    - .rw2
+    - .raf
+    - .pef
+    - .srw
   recursive: true
   follow_symlinks: false
   exclude_dirs: [.git, __pycache__, .culler_cache]
