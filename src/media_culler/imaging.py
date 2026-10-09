@@ -14,12 +14,17 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pillow_heif
 from PIL import Image, ImageOps
 
 from media_culler.exceptions import ImageLoadError
 
-pillow_heif.register_heif_opener()
+try:  # optional: pip install 'ai-media-culler[formats]'
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    HEIF_AVAILABLE = True
+except ImportError:  # core install: HEIC/HEIF files simply fail to open (reported per file)
+    HEIF_AVAILABLE = False
 
 EXIF_ORIENTATION = 0x0112
 _SWAPPED_ORIENTATIONS = {5, 6, 7, 8}

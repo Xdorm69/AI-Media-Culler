@@ -39,27 +39,25 @@ class PathsConfig(_Section):
 
 class ScanConfig(_Section):
     extensions: list[str] = [
+        ".arw",
         ".bmp",
+        ".cr2",
+        ".cr3",
+        ".dng",
+        ".heic",
+        ".heif",
         ".jpeg",
         ".jpg",
+        ".nef",
+        ".orf",
+        ".pef",
         ".png",
+        ".raf",
+        ".rw2",
+        ".srw",
         ".tif",
         ".tiff",
         ".webp",
-        # HEIC / HEIF
-        ".heic",
-        ".heif",
-        # Camera RAW
-        ".dng",
-        ".cr2",
-        ".cr3",
-        ".nef",
-        ".arw",
-        ".orf",
-        ".rw2",
-        ".raf",
-        ".pef",
-        ".srw",
     ]
     recursive: bool = True
     follow_symlinks: bool = False

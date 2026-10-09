@@ -97,3 +97,16 @@ def test_phash_is_stable_across_exif_rotation(tmp_path):
     upright = load_rgb(_oriented(tmp_path, 1), 10**9)
     rotated = load_rgb(_oriented(tmp_path, 1), 10**9)
     assert perceptual_hash(upright) == perceptual_hash(rotated)
+
+
+def test_core_import_works_without_pillow_heif():
+    """Regression: pillow-heif lives in an optional extra; core installs must still import."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.modules['pillow_heif'] = None; "
+        "import media_culler.imaging as m; assert m.HEIF_AVAILABLE is False"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
