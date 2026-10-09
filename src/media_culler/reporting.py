@@ -41,6 +41,7 @@ class Summary(BaseModel):
     median_score: float | None
     analyzer_failures: dict[str, int]
     scene_counts: dict[str, int] = Field(default_factory=dict)
+    closed_eyes_photos: int = 0
     top: list[TopImage]
 
 
@@ -93,6 +94,9 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int 
         median_score=round(statistics.median(values), 2) if values else None,
         analyzer_failures=failures,
         scene_counts=dict(sorted(scenes.items())),
+        closed_eyes_photos=sum(
+            1 for r in valid if r.scores and r.scores.group and r.scores.group.closed_eyes
+        ),
         top=[
             TopImage(
                 filename=r.filename,
@@ -153,6 +157,8 @@ CSV_COLUMNS = [
     "subject",
     "composition",
     "faces",
+    "subjects",
+    "closed_eyes",
     "duplicate_group",
     "group_role",
     "width",
@@ -178,6 +184,8 @@ def _csv_row(r: ImageRecord) -> dict[str, Any]:
         "subject": s.subject if s else None,
         "composition": s.composition if s else None,
         "faces": r.faces.face_count if r.faces else None,
+        "subjects": len(s.group.significant) if s and s.group else None,
+        "closed_eyes": len(s.group.closed_eyes) if s and s.group else None,
         "duplicate_group": r.duplicate_group,
         "group_role": r.group_role.value if r.group_role else "",
         "width": r.width,

@@ -69,7 +69,7 @@ def test_no_faces_is_neutral_not_penalised():
 
 
 def test_two_faces_weight_the_weaker_one():
-    good, bad = _face(), _face(eyes=EyeMetrics(left=0.1, right=0.1, average=0.1))
+    good, bad = _face(), _face(eyes=EyeMetrics(left=0.16, right=0.16, average=0.16))  # squint
     s, _ = score_subject(FaceAnalysis(face_count=2, faces=[good, bad]))
     only_good = score_subject(FaceAnalysis(face_count=1, faces=[good]))[0]
     only_bad = score_subject(FaceAnalysis(face_count=1, faces=[bad]))[0]

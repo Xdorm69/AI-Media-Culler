@@ -166,6 +166,11 @@ def print_results(
     if report.summary.scene_counts:
         mix = " · ".join(f"{n} {name}" for name, n in report.summary.scene_counts.items())
         console.print(f"[muted]scenes: {mix}[/]")
+    if report.summary.closed_eyes_photos:
+        console.print(
+            f"[muted]closed eyes flagged in {report.summary.closed_eyes_photos} photo(s): "
+            "capped at review; the CSV 'closed_eyes' column lists them[/]"
+        )
     notes = notes_panel(report)
     if notes:
         console.print(notes)

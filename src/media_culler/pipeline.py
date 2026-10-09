@@ -246,4 +246,4 @@ class Pipeline:
                 record.scores = score_record(record, self.settings)
         rank_collection(records)
         apply_recommendations(records, self.settings.thresholds)
-        select_best_shots(records)
+        select_best_shots(records, self.settings.selection)

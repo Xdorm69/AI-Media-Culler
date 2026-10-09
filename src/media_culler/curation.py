@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from media_culler.config import ThresholdsConfig
+import statistics
+
+from media_culler.config import SelectionConfig, ThresholdsConfig
 from media_culler.models import GroupRole, ImageRecord, Recommendation, SceneType
 
 
@@ -37,6 +39,16 @@ def _soft_focus_landscape(record: ImageRecord, thresholds: ThresholdsConfig) -> 
     return sharpness is not None and sharpness < thresholds.soft_focus_sharpness
 
 
+def _closed_eyes(record: ImageRecord) -> int:
+    group = record.scores.group if record.scores else None
+    return len(group.closed_eyes) if group else 0
+
+
+def _significant_faces(record: ImageRecord) -> int:
+    group = record.scores.group if record.scores else None
+    return len(group.significant) if group else 0
+
+
 def classify(record: ImageRecord, thresholds: ThresholdsConfig) -> tuple[Recommendation, str]:
     final = record.final_score
     technical = record.scores.technical if record.scores else None
@@ -46,6 +58,10 @@ def classify(record: ImageRecord, thresholds: ThresholdsConfig) -> tuple[Recomme
         return Recommendation.REJECT, "Very low technical quality"
     if _soft_focus_landscape(record, thresholds) and final >= thresholds.review:
         return Recommendation.REVIEW, "Landscape is soft/out of focus; check before keeping"
+    closed = _closed_eyes(record)
+    if thresholds.closed_eyes_gate and closed and final >= thresholds.review:
+        total = _significant_faces(record)
+        return Recommendation.REVIEW, f"Closed eyes on {closed} of {total} faces; check first"
     if final >= thresholds.select:
         return Recommendation.SELECT, "High overall photographic score"
     if final >= thresholds.usable:
@@ -61,7 +77,25 @@ def apply_recommendations(records: list[ImageRecord], thresholds: ThresholdsConf
             record.recommendation, record.recommendation_reason = classify(record, thresholds)
 
 
-def select_best_shots(records: list[ImageRecord]) -> None:
+def _selection_value(record: ImageRecord) -> float:
+    """Selection score, falling back to the final score for records that predate it."""
+    scores = record.scores
+    if scores is None:
+        return -1.0
+    if scores.selection is not None:
+        return scores.selection
+    return scores.final if scores.final is not None else -1.0
+
+
+def select_best_shots(records: list[ImageRecord], config: SelectionConfig | None = None) -> None:
+    """Pick one representative per similar-image group.
+
+    Frames are compared on their *selection* score (no AI component). Within ``margin`` points
+    of the best, the frame with the fewest problems wins, where a problem is a subject with
+    closed eyes or a subject that went missing (fewer faces than the group's typical frame).
+    Outside the margin, quality wins: nobody should keep a blurry frame just for open eyes.
+    """
+    config = config or SelectionConfig()
     groups: dict[int, list[ImageRecord]] = {}
     for record in records:
         if record.status != "valid":
@@ -73,15 +107,48 @@ def select_best_shots(records: list[ImageRecord]) -> None:
             groups.setdefault(record.duplicate_group, []).append(record)
 
     for members in groups.values():
-        best = min(members, key=_sort_key)  # unscored (None -> 0.0) naturally sort last
-        best_score = best.final_score
-        for record in members:
-            record.best_shot_score = best_score
-            if record is best:
-                record.group_role = GroupRole.REPRESENTATIVE
-                record.is_group_representative = True
-                record.selection_reason = "Highest final score in similar-image group"
+        _select_in_group(members, config)
+
+
+def _select_in_group(members: list[ImageRecord], config: SelectionConfig) -> None:
+    scored = [r for r in members if _selection_value(r) >= 0]
+    pool = scored or members
+
+    # The median (not max) face count, so one false detection can't make every other frame
+    # look like it lost a person.
+    typical = int(statistics.median_high([_significant_faces(r) for r in pool]))
+
+    def problems(record: ImageRecord) -> int:
+        return _closed_eyes(record) + max(0, typical - _significant_faces(record))
+
+    top = max(_selection_value(r) for r in pool)
+    contenders = [r for r in pool if _selection_value(r) >= top - config.margin]
+    best = min(contenders, key=lambda r: (problems(r), -_selection_value(r), r.path))
+    strongest = min(pool, key=lambda r: (-_selection_value(r), r.path))
+
+    for record in members:
+        record.best_shot_score = best.final_score
+        if record is best:
+            record.group_role = GroupRole.REPRESENTATIVE
+            record.is_group_representative = True
+            if best is not strongest and problems(best) < problems(strongest):
+                record.selection_reason = (
+                    "Chosen over a slightly higher-scoring frame because it has fewer "
+                    f"problems ({problems(best)} vs {problems(strongest)}): "
+                    "eyes open and everyone present"
+                )
             else:
-                record.group_role = GroupRole.SIMILAR
-                record.is_group_representative = False
-                record.selection_reason = "Lower final score than group representative"
+                record.selection_reason = "Highest selection score in similar-image group"
+        else:
+            record.group_role = GroupRole.SIMILAR
+            record.is_group_representative = False
+            record.selection_reason = _why_not(record, best, problems(record), problems(best))
+
+
+def _why_not(record: ImageRecord, best: ImageRecord, mine: int, theirs: int) -> str:
+    closed = _closed_eyes(record)
+    if closed and mine > theirs:
+        return f"Closed eyes on {closed} face(s); a better frame exists in this group"
+    if mine > theirs:
+        return "A subject is missing or turned away compared with the best frame"
+    return "Lower selection score than the group's best shot"

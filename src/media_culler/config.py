@@ -84,6 +84,9 @@ class ThresholdsConfig(_Section):
     # Landscapes whose sharpness sub-score (0-100) is below this are capped at "review", however
     # well composed: a level horizon must not rescue an out-of-focus frame. 0 disables the gate.
     soft_focus_sharpness: float = Field(12, ge=0, le=100)
+    # Photos where a subject's eyes are clearly closed are capped at "review" (a person can
+    # decide; a blink is sometimes intended). Disable with false.
+    closed_eyes_gate: bool = True
 
     @model_validator(mode="after")
     def _ordered(self) -> ThresholdsConfig:
@@ -153,6 +156,26 @@ class SceneConfig(_Section):
     heuristic_horizon_confidence: float = Field(0.6, ge=0, le=1)
 
 
+class SelectionConfig(_Section):
+    """Who counts as a subject, when eyes count as closed, and how best shots are chosen."""
+
+    # A face is a subject if it covers at least this fraction of the frame...
+    min_face_area: float = Field(0.002, ge=0, le=1)
+    # ...and at least this fraction of the LARGEST face (so passers-by are ignored but a
+    # whole group photographed from far away is still a group).
+    relative_face_area: float = Field(0.12, ge=0, le=1)
+    # Eyes are judged only on faces at least this large; landmarks on tiny faces are too noisy.
+    blink_min_face_area: float = Field(0.004, ge=0, le=1)
+    # Eye-aspect-ratio below this means "closed" (open eyes are typically 0.22-0.35).
+    closed_ear_threshold: float = Field(0.14, ge=0, le=1)
+    # A face with closed eyes cannot score above this; one closed face caps the whole subject.
+    closed_face_cap: float = Field(45, ge=0, le=100)
+    closed_subject_cap: float = Field(60, ge=0, le=100)
+    # Among similar frames, only those within this many points of the best may win on
+    # "nobody blinked", so a sharp frame is never beaten by a blurry one just for open eyes.
+    margin: float = Field(12, ge=0, le=100)
+
+
 class PerformanceConfig(_Section):
     # Worker threads for scanning/hashing and for decode + OpenCV analysis prefetch.
     workers: int = Field(4, ge=1, le=64)
@@ -168,6 +191,7 @@ class Settings(_Section):
     vision: VisionConfig = VisionConfig()
     faces: FacesConfig = FacesConfig()
     scene: SceneConfig = SceneConfig()
+    selection: SelectionConfig = SelectionConfig()
     performance: PerformanceConfig = PerformanceConfig()
 
     @property
@@ -289,6 +313,7 @@ thresholds:                         # final score (0-100) cut-offs
   review: 45
   technical_floor: 25               # below this technical score => always reject_candidate
   soft_focus_sharpness: 12          # landscapes softer than this sub-score are capped at review
+  closed_eyes_gate: true            # photos with a subject's eyes closed are capped at review
 
 weights:                            # relative; normalised over available components
   technical: 0.40
@@ -322,6 +347,15 @@ scene:                              # landscape-aware scoring
   horizon_min_confidence: 0.35      # ignore weaker horizon detections
   heuristic_without_ai: true        # guess "landscape" from a strong horizon when AI is off
   heuristic_horizon_confidence: 0.6
+
+selection:                          # group photos and best-shot choice
+  min_face_area: 0.002              # smaller faces are never subjects
+  relative_face_area: 0.12          # ...nor faces much smaller than the largest one
+  blink_min_face_area: 0.004        # eyes are only judged on faces at least this large
+  closed_ear_threshold: 0.14        # eye-aspect-ratio below this = closed
+  closed_face_cap: 45               # max score of a face with closed eyes
+  closed_subject_cap: 60            # max subject score if any subject has closed eyes
+  margin: 12                        # open-eyes can only win within this many points of the best
 
 performance:
   workers: 4

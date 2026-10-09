@@ -4,6 +4,7 @@ from media_culler.config import Settings, WeightsConfig
 from media_culler.models import ImageRecord, SceneType, Scores
 from media_culler.scoring.ai import score_ai
 from media_culler.scoring.composition import score_composition
+from media_culler.scoring.group import assess_faces, subject_faces
 from media_culler.scoring.landscape import score_landscape_composition, technical_overrides
 from media_culler.scoring.scene import classify_scene
 from media_culler.scoring.subject import score_subject
@@ -57,15 +58,29 @@ def score_record(record: ImageRecord, settings: Settings) -> Scores:
             )
             scores.details["composition"] = composition_details
     elif record.faces is not None:
-        scores.subject, scores.details["subject"] = score_subject(record.faces)
+        assessment = assess_faces(record.faces, settings.selection)
+        scores.group = assessment
+        scores.subject, scores.details["subject"] = score_subject(
+            record.faces, settings.selection, assessment
+        )
         scores.composition, scores.details["composition"] = score_composition(
-            record.faces, record.width, record.height
+            subject_faces(record.faces, assessment), record.width, record.height
         )
 
     scores.final, scores.weights_used = combine(
         {
             "technical": scores.technical,
             "ai": scores.ai,
+            "subject": scores.subject,
+            "composition": scores.composition,
+        },
+        settings.weights,
+    )
+    # Frames of one scene share content, so the AI label (which flips between near-identical
+    # frames) is noise there. Selection compares them on what actually varies.
+    scores.selection, _ = combine(
+        {
+            "technical": scores.technical,
             "subject": scores.subject,
             "composition": scores.composition,
         },

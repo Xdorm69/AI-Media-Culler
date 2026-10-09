@@ -105,6 +105,19 @@ class SceneMetrics(BaseModel):
 # ------------------------------------------------------------------------- scores
 
 
+class GroupAssessment(BaseModel):
+    """Which detected faces count as the photo's subjects, and what state they are in.
+
+    Indices refer to ``FaceAnalysis.faces``. Background faces (passers-by, far-away crowd)
+    are neither scored nor allowed to veto a frame.
+    """
+
+    significant: list[int] = Field(default_factory=list)
+    closed_eyes: list[int] = Field(default_factory=list)  # subset of significant
+    looking_away: list[int] = Field(default_factory=list)  # subset of significant
+    ignored: int = 0  # detected faces judged to be background
+
+
 class Scores(BaseModel):
     technical: float | None = None
     ai: float | None = None
@@ -112,6 +125,9 @@ class Scores(BaseModel):
     composition: float | None = None
     final: float | None = None
     scene_type: SceneType | None = None
+    # Final score without the AI component: what frames of one scene are compared on.
+    selection: float | None = None
+    group: GroupAssessment | None = None
     # Normalised weights actually applied (components that were unavailable are absent).
     weights_used: dict[str, float] = Field(default_factory=dict)
     details: dict[str, Any] = Field(default_factory=dict)

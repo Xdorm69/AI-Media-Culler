@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from media_culler.models import FaceAnalysis, FaceInfo
+from media_culler.config import SelectionConfig
+from media_culler.models import FaceAnalysis, FaceInfo, GroupAssessment
 from media_culler.scoring._math import clamp, ramp
+from media_culler.scoring.group import assess_faces
 
 NO_FACE_SCORE = 50.0  # neutral: absence of faces is not a defect
 
@@ -25,11 +27,29 @@ def score_face(face: FaceInfo) -> dict[str, float]:
     }
 
 
-def score_subject(analysis: FaceAnalysis) -> tuple[float, dict[str, object]]:
-    if not analysis.faces:
-        return NO_FACE_SCORE, {"face_scores": [], "reason": "No detectable faces"}
+def score_subject(
+    analysis: FaceAnalysis,
+    config: SelectionConfig | None = None,
+    assessment: GroupAssessment | None = None,
+) -> tuple[float, dict[str, object]]:
+    config = config or SelectionConfig()
+    assessment = assessment or assess_faces(analysis, config)
 
-    face_scores = [score_face(face)["face_score"] for face in analysis.faces]
+    if not assessment.significant:
+        reason = "Only distant/background faces" if analysis.faces else "No detectable faces"
+        return NO_FACE_SCORE, {
+            "face_scores": [],
+            "reason": reason,
+            "ignored_faces": len(analysis.faces),
+        }
+
+    face_scores: list[float] = []
+    for index in assessment.significant:
+        score = score_face(analysis.faces[index])["face_score"]
+        if index in assessment.closed_eyes:
+            # The weighted sum lets a face with shut eyes still score ~80: cap it explicitly.
+            score = min(score, config.closed_face_cap)
+        face_scores.append(score)
     ordered = sorted(face_scores, reverse=True)
 
     if len(ordered) == 1:
@@ -41,4 +61,12 @@ def score_subject(analysis: FaceAnalysis) -> tuple[float, dict[str, object]]:
         score = sum(ordered) / len(ordered) * 0.70 + ordered[-1] * 0.30
         reason = "Group average with weakest-subject penalty"
 
-    return round(score, 2), {"face_scores": face_scores, "reason": reason}
+    if assessment.closed_eyes:
+        score = min(score, config.closed_subject_cap)
+
+    return round(score, 2), {
+        "face_scores": face_scores,
+        "reason": reason,
+        "ignored_faces": assessment.ignored,
+        "closed_eyes": len(assessment.closed_eyes),
+    }
