@@ -53,12 +53,13 @@ Exit codes: `0` ok · `1` runtime error · `2` bad usage/config · `130` interru
 ## Architecture
 
 ```
-cli.py ─────────► pipeline.py ──► scanner.py        discover files, metadata, sha256 (threaded)
- │  (Typer)         │            analyzers/          technical · vision (SigLIP) · faces (MediaPipe)
+cli.py ─────────► pipeline.py ──► scanner.py        discover files, metadata, EXIF time, sha256 (threaded)
+ │  (Typer)         │            analyzers/          technical · scene · vision (SigLIP) · faces (MediaPipe)
  │                  │            cache.py            sqlite, keyed by (content hash, analyzer, fingerprint)
- ▼                  ├──────────► duplicates.py       pHash Hamming grouping
+ ▼                  ├──────────► duplicates.py       appearance clusters + burst links → groups
 ui/ (Rich)          ├──────────► scoring/            PURE functions: metrics → 0-100 scores
- render, progress   └──────────► curation.py         rank · recommend · best shot
+ render, progress   │                                (technical · landscape · group · subject · composition)
+                    └──────────► curation.py         rank · recommend · best shot per group
                     reporting.py   organizer.py   model_download.py   doctor.py
 models.py (typed records)   config.py (validated settings)   imaging.py (single decode path)
 ```
@@ -81,6 +82,39 @@ Design rules that keep it modular:
 Unknown keys are rejected so typos fail loudly. Weights are normalised over the components that
 actually exist for an image, so disabling or losing the AI model never silently scores it as 0.
 
+## Scenes, group photos and bursts
+
+**Landscapes.** A photo is judged as a landscape when the vision model's top content label is
+"landscape" (or, with AI off, when a strong horizon is found) *and* no face is big enough to be
+the subject (`scene.people_min_face_area`). Landscapes then use scenery rules instead of portrait
+rules: exposure from highlight/shadow **clipping** (not mean brightness, which punished sunsets and
+snow), **dynamic range** instead of global contrast, **tiled sharpness** (75th-percentile tile, so
+a crisp scene with empty sky is not "blurry"), and composition from **horizon level** (signed tilt),
+**horizon placement** and the **focal point** (spectral-residual saliency). Subject is excluded from
+the weighted score rather than scored as a neutral 50. A landscape that is out of focus is capped at
+`review` (`thresholds.soft_focus_sharpness`), so good composition cannot rescue it.
+
+**Group photos.** Only *subjects* count: a face must cover `selection.min_face_area` of the frame and
+`selection.relative_face_area` of the largest face, so passers-by are ignored but a distant group is
+still a group. A subject whose eyes are clearly closed (`selection.closed_ear_threshold`; judged only on
+faces big enough to read and not in profile) caps that face and the whole subject score, and caps the
+photo at `review` (`thresholds.closed_eyes_gate`).
+
+**Bursts and best-shot choice.** Capture time comes from EXIF (never file mtime). A frame joins any frame
+within `bursts.max_gap_seconds` that looks continuous with it (`bursts.hamming_threshold`, looser than
+the duplicate threshold), so a panning or moving sequence groups even when its first and last frames
+differ. Groups are labelled `duplicate` (byte-identical), `burst` or `similar`. Within a group frames
+are compared on a *selection score* (final score without the AI component, because AI labels flip
+between near-identical frames) minus a **relative-sharpness** penalty
+(`selection.sharpness_weight`). Within `selection.margin` points of the best, the frame with the fewest
+problems wins (closed eyes, or a subject missing compared with the group's median); outside the margin
+quality wins. Every frame's `selection_reason` says why it was kept or dropped.
+
+All of these thresholds are heuristics chosen without a labelled photo set; see *Known limitations*
+and tune them in `culler.yaml` (`scene`, `selection`, `bursts`, `thresholds`).
+
+Report schema is now **3** (additive). Schema-2 reports still load.
+
 ## Behaviour changes from v0.1 (deliberate)
 
 | Issue in v0.1 | Now |
@@ -100,12 +134,24 @@ actually exist for an image, so disabling or losing the AI model never silently 
 ## Known limitations
 
 * Scoring formulas and thresholds are the original heuristics, **not calibrated** on a labelled set.
-* Composition is face-based: images with no faces get a neutral 50 for subject and composition.
+* Composition is face-based except for landscapes: a photo that is neither (food, objects, architecture)
+  still gets a neutral 50 for subject and composition.
+* Eye state uses an eye-aspect-ratio threshold on MediaPipe landmarks. It is conservative, but it has
+  not been validated across faces, glasses or lighting; a wink is not detected and glare can hide eyes.
+  `closed_ear_threshold` and `closed_eyes_gate` are there to tune or turn it off.
+* Horizon detection finds one dominant, near-level line. Mountains, shorelines at an angle, or
+  reflections can fool it; weak detections (`scene.horizon_min_confidence`) are ignored.
+* Burst grouping needs EXIF capture time. Without it, frames group by appearance alone. A RAW+JPEG
+  pair shot together is grouped like a burst. Bursts are keyed to capture time as written, with no
+  time zone, so two cameras with different clock settings will not link.
 * MediaPipe landmarks carry no visibility, so that sub-score is a constant 1.0.
 * Duplicate grouping is O(n²) (vectorised; fine for ~10⁴ images, use an LSH/BK-tree beyond that).
 * Hashes detect *similar framing*, so a heavily blurred twin of a photo groups with it; that is
   intentional (the sharper one is picked as representative).
-* HEIC/RAW are not supported (would need `pillow-heif` / `rawpy`).
+* HEIC/HEIF is decoded through `pillow-heif` (extra `formats`). **Camera RAW is not decoded**: the RAW
+  extensions are scanned, but `rawpy` is not wired into `imaging.load_rgb`. TIFF-based RAW (DNG, NEF,
+  ARW, CR2...) may open through Pillow as a small embedded preview and be scored on that, so keep RAW
+  out of the input folder until that is implemented.
 
 ## Development
 
