@@ -1,0 +1,2586 @@
+From 5284c0539f22b57d5d82a5ab5ede1460d5b043fe Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 02:22:26 +0000
+Subject: [PATCH 1/5] feat: decode camera RAW with rawpy and treat RAW+JPEG as
+ one shot
+
+RAW files were accepted by the scanner but never decoded with rawpy; TIFF-based
+containers opened through Pillow as a small embedded preview and were scored as if
+it were the photo. They are now decoded with rawpy (orientation, size limit and
+EXIF capture time handled, half-size optional), and a clear per-file error says
+what to install when rawpy is missing.
+
+A JPEG sitting beside a same-named RAW is that RAW's companion: it takes no part
+in grouping, ranking or best-shot selection and inherits the RAW's decisions, so
+both files always land in the same bucket instead of being 'culled' as a burst.
+
+Report schema 4 (additive): paired_with.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ src/media_culler/config.py    |   7 +
+ src/media_culler/imaging.py   |  93 +++++++++++++
+ src/media_culler/models.py    |   4 +
+ src/media_culler/pairing.py   |  80 ++++++++++++
+ src/media_culler/pipeline.py  |  20 ++-
+ src/media_culler/reporting.py |  10 +-
+ tests/test_raw.py             | 237 ++++++++++++++++++++++++++++++++++
+ 7 files changed, 444 insertions(+), 7 deletions(-)
+ create mode 100644 src/media_culler/pairing.py
+ create mode 100644 tests/test_raw.py
+
+diff --git a/src/media_culler/config.py b/src/media_culler/config.py
+index d82faab..4fef52d 100644
+--- a/src/media_culler/config.py
++++ b/src/media_culler/config.py
+@@ -64,6 +64,11 @@ class ScanConfig(_Section):
+     exclude_dirs: list[str] = [".git", "__pycache__", ".culler_cache"]
+     # Safety limit against decompression bombs / accidental gigapixel panoramas.
+     max_pixels: int = Field(250_000_000, gt=0)
++    # Camera RAW is decoded with rawpy. Half-size is ~4x faster but halves the resolution the
++    # sharpness readings are taken at, so RAW and JPEG scores are less comparable.
++    raw_half_size: bool = False
++    # A RAW file with a same-named JPEG beside it (RAW+JPEG shooting) is ONE shot, not a burst.
++    pair_raw_jpeg: bool = True
+ 
+     @field_validator("extensions")
+     @classmethod
+@@ -326,6 +331,8 @@ scan:
+   follow_symlinks: false
+   exclude_dirs: [.git, __pycache__, .culler_cache]
+   max_pixels: 250000000             # refuse images larger than this (decompression-bomb guard)
++  raw_half_size: false              # faster RAW decode, but sharpness is read at half resolution
++  pair_raw_jpeg: true               # a RAW with a same-named JPEG beside it is one shot
+ 
+ thresholds:                         # final score (0-100) cut-offs
+   select: 80
+diff --git a/src/media_culler/imaging.py b/src/media_culler/imaging.py
+index b96c672..782976d 100644
+--- a/src/media_culler/imaging.py
++++ b/src/media_culler/imaging.py
+@@ -8,10 +8,12 @@ from __future__ import annotations
+ 
+ import contextlib
+ import hashlib
++import io
+ from dataclasses import dataclass
+ from datetime import datetime
+ from functools import cached_property
+ from pathlib import Path
++from typing import Any
+ 
+ import cv2
+ import numpy as np
+@@ -27,6 +29,23 @@ try:  # optional: pip install 'ai-media-culler[formats]'
+ except ImportError:  # core install: HEIC/HEIF files simply fail to open (reported per file)
+     HEIF_AVAILABLE = False
+ 
++try:  # optional, same extra as pillow-heif
++    import rawpy as _rawpy
++
++    rawpy: Any = _rawpy  # untyped on purpose: its stubs differ between releases
++    RAW_AVAILABLE = True
++except ImportError:
++    rawpy = None
++    RAW_AVAILABLE = False
++
++# Camera RAW containers. Pillow can open some of these (TIFF-based ones) but only as a
++# small embedded preview, which would be scored as if it were the photo: decode with rawpy.
++RAW_EXTENSIONS = frozenset(
++    {".arw", ".cr2", ".cr3", ".dng", ".nef", ".nrw", ".orf", ".pef", ".raf", ".rw2", ".srw"}
++)
++_RAW_FLIPS_SWAPPING = {5, 6}  # LibRaw flip codes that rotate by 90 degrees
++_raw_half_size = False
++
+ EXIF_ORIENTATION = 0x0112
+ _EXIF_IFD = 0x8769
+ _TIME_TAGS = (0x9003, 0x9004)  # DateTimeOriginal, DateTimeDigitized
+@@ -49,6 +68,16 @@ def configure_pillow(max_pixels: int) -> None:
+     Image.MAX_IMAGE_PIXELS = max_pixels
+ 
+ 
++def configure_raw(half_size: bool) -> None:
++    """Choose RAW decode resolution: half-size is ~4x faster but changes sharpness readings."""
++    global _raw_half_size
++    _raw_half_size = half_size
++
++
++def is_raw(path: Path) -> bool:
++    return path.suffix.lower() in RAW_EXTENSIONS
++
++
+ def sha256_file(path: Path) -> str:
+     hasher = hashlib.sha256()
+     with path.open("rb") as handle:
+@@ -88,8 +117,67 @@ def parse_capture_time(exif: Image.Exif) -> str | None:
+     return None
+ 
+ 
++def _require_rawpy() -> None:
++    if not RAW_AVAILABLE:
++        raise ImageLoadError("RAW decoding needs rawpy: pip install 'ai-media-culler[formats]'")
++
++
++def _raw_capture_time(path: Path, raw: Any) -> str | None:
++    """EXIF capture time of a RAW file: the container's own EXIF, else its embedded preview's."""
++    try:
++        with Image.open(path) as image:  # TIFF-based RAW (DNG, NEF, ARW, CR2...)
++            moment = parse_capture_time(image.getexif())
++        if moment:
++            return moment
++    except Exception:
++        pass
++    try:
++        thumb = raw.extract_thumb()
++        if thumb.format == rawpy.ThumbFormat.JPEG:
++            with Image.open(io.BytesIO(thumb.data)) as preview:
++                return parse_capture_time(preview.getexif())
++    except Exception:
++        pass
++    return None
++
++
++def _read_raw_header(path: Path, max_pixels: int) -> ImageHeader:
++    _require_rawpy()
++    try:
++        with rawpy.imread(str(path)) as raw:
++            width, height = int(raw.sizes.width), int(raw.sizes.height)
++            flip = int(raw.sizes.flip)
++            captured_at = _raw_capture_time(path, raw)
++    except Exception as error:
++        raise ImageLoadError(f"Cannot open RAW file: {error}") from error
++    if width * height > max_pixels:
++        raise ImageLoadError(f"Image too large ({width}x{height} > {max_pixels} pixels)")
++    if flip in _RAW_FLIPS_SWAPPING:
++        width, height = height, width
++    return ImageHeader(width=width, height=height, format="RAW", captured_at=captured_at)
++
++
++def _load_raw(path: Path, max_pixels: int) -> np.ndarray:
++    _require_rawpy()
++    try:
++        with rawpy.imread(str(path)) as raw:
++            if raw.sizes.width * raw.sizes.height > max_pixels:
++                raise ImageLoadError(
++                    f"Image too large ({raw.sizes.width}x{raw.sizes.height} > {max_pixels} pixels)"
++                )
++            # LibRaw applies the camera's orientation flag itself.
++            rgb = raw.postprocess(use_camera_wb=True, half_size=_raw_half_size, output_bps=8)
++    except ImageLoadError:
++        raise
++    except Exception as error:
++        raise ImageLoadError(f"Cannot decode RAW file: {error}") from error
++    return np.ascontiguousarray(rgb, dtype=np.uint8)
++
++
+ def read_header(path: Path, max_pixels: int) -> ImageHeader:
+     """Read dimensions/format without decoding pixels. Raises ImageLoadError."""
++    if is_raw(path):
++        return _read_raw_header(path, max_pixels)
+     try:
+         with Image.open(path) as image:
+             width, height = image.size
+@@ -109,6 +197,11 @@ def read_header(path: Path, max_pixels: int) -> ImageHeader:
+ 
+ def load_rgb(path: Path, max_pixels: int) -> np.ndarray:
+     """Decode to an orientation-corrected, C-contiguous uint8 RGB array (H, W, 3)."""
++    if is_raw(path):
++        array = _load_raw(path, max_pixels)
++        if array.ndim != 3 or array.shape[0] == 0 or array.shape[1] == 0:
++            raise ImageLoadError("Decoded image has invalid shape")
++        return array
+     try:
+         with Image.open(path) as image:
+             if image.width * image.height > max_pixels:
+diff --git a/src/media_culler/models.py b/src/media_culler/models.py
+index 92bf2ed..bcbc866 100644
+--- a/src/media_culler/models.py
++++ b/src/media_culler/models.py
+@@ -172,6 +172,10 @@ class ImageRecord(BaseModel):
+     collection_size: int | None = None
+     collection_percentile: float | None = None
+ 
++    # Set on a JPEG that is the companion of a RAW file (RAW+JPEG shooting): the RAW's
++    # relative_path. The companion takes part in no group; it inherits the RAW's decisions.
++    paired_with: str | None = None
++
+     duplicate_group: int | None = None
+     duplicate_group_size: int = 1
+     group_kind: GroupKind | None = None
+diff --git a/src/media_culler/pairing.py b/src/media_culler/pairing.py
+new file mode 100644
+index 0000000..bf288d4
+--- /dev/null
++++ b/src/media_culler/pairing.py
+@@ -0,0 +1,80 @@
++"""RAW+JPEG pairs: two files, one shot.
++
++Cameras set to RAW+JPEG write ``IMG_0001.CR2`` and ``IMG_0001.JPG`` for the same frame.
++Left alone, the pair looks like a two-frame burst and the tool would "cull" one of them.
++Instead the JPEG becomes the RAW's *companion*: it takes part in no group and simply
++inherits the RAW's decisions, so both files always land in the same bucket.
++"""
++
++from __future__ import annotations
++
++from datetime import datetime
++from pathlib import Path
++
++from media_culler.imaging import is_raw
++from media_culler.models import ImageRecord
++
++# Same-named files this far apart in capture time are different shots (a counter rolled over).
++_MAX_PAIR_GAP_SECONDS = 2.0
++_INHERITED = (
++    "recommendation",
++    "recommendation_reason",
++    "group_role",
++    "is_group_representative",
++    "best_shot_score",
++    "selection_reason",
++)
++
++
++def _key(record: ImageRecord) -> tuple[Path, str]:
++    path = Path(record.relative_path)
++    return path.parent, path.stem.lower()
++
++
++def _same_moment(a: ImageRecord, b: ImageRecord) -> bool:
++    if not a.captured_at or not b.captured_at:
++        return True  # nothing to contradict the matching name
++    try:
++        gap = abs(datetime.fromisoformat(a.captured_at) - datetime.fromisoformat(b.captured_at))
++    except ValueError:
++        return True
++    return gap.total_seconds() <= _MAX_PAIR_GAP_SECONDS
++
++
++def link_raw_companions(records: list[ImageRecord]) -> int:
++    """Mark every JPEG/HEIC/... that sits beside a same-named RAW; returns the pair count.
++
++    Only pairs where *both* files decoded are linked: if the RAW failed, the other file is
++    the only usable copy of the shot and is treated as an ordinary photo.
++    """
++    raws: dict[tuple[Path, str], ImageRecord] = {}
++    for record in sorted(records, key=lambda r: r.path):
++        if record.status == "valid" and is_raw(Path(record.path)):
++            raws.setdefault(_key(record), record)
++
++    pairs = 0
++    for record in records:
++        record.paired_with = None
++        if record.status != "valid" or is_raw(Path(record.path)):
++            continue
++        raw = raws.get(_key(record))
++        if raw is not None and _same_moment(raw, record):
++            record.paired_with = raw.relative_path
++            pairs += 1
++    return pairs
++
++
++def inherit_companion_decisions(records: list[ImageRecord]) -> None:
++    """Copy the RAW's recommendation and group decisions onto its companion file."""
++    by_path = {r.relative_path: r for r in records}
++    for record in records:
++        if record.paired_with is None:
++            continue
++        raw = by_path.get(record.paired_with)
++        if raw is None:
++            continue
++        for name in _INHERITED:
++            setattr(record, name, getattr(raw, name))
++        record.selection_reason = f"Companion of {raw.filename}; follows its decision" + (
++            f" ({raw.selection_reason})" if raw.selection_reason else ""
++        )
+diff --git a/src/media_culler/pipeline.py b/src/media_culler/pipeline.py
+index d3e192c..ad74b5d 100644
+--- a/src/media_culler/pipeline.py
++++ b/src/media_culler/pipeline.py
+@@ -19,9 +19,10 @@ from media_culler.config import Settings
+ from media_culler.curation import apply_recommendations, rank_collection, select_best_shots
+ from media_culler.duplicates import assign_duplicate_groups
+ from media_culler.exceptions import AnalyzerUnavailable, ImageLoadError
+-from media_culler.imaging import ImageContext, configure_pillow
++from media_culler.imaging import ImageContext, configure_pillow, configure_raw
+ from media_culler.logging_setup import silence_third_party
+ from media_culler.models import ImageRecord
++from media_culler.pairing import inherit_companion_decisions, link_raw_companions
+ from media_culler.progress import NullReporter, ProgressReporter
+ from media_culler.scanner import scan_directory
+ from media_culler.scoring import score_record
+@@ -80,6 +81,7 @@ class Pipeline:
+         started_at = datetime.now(timezone.utc).isoformat()
+         root = input_directory or self.settings.paths.input_directory
+         configure_pillow(self.settings.scan.max_pixels)
++        configure_raw(self.settings.scan.raw_half_size)
+ 
+         records = scan_directory(root, self.settings, self.reporter)
+         result = RunResult(
+@@ -235,11 +237,20 @@ class Pipeline:
+ 
+     def _curate(self, result: RunResult) -> None:
+         records = result.records
++        if self.settings.scan.pair_raw_jpeg:
++            link_raw_companions(records)
++        else:
++            for record in records:
++                record.paired_with = None
++        # Companions are scored (their own numbers stay visible) but take no part in grouping,
++        # ranking or best-shot choice: they inherit the RAW's decision afterwards.
++        shots = [r for r in records if r.paired_with is None]
++
+         duplicates, bursts = self.settings.duplicates, self.settings.bursts
+         if duplicates.enabled or bursts.enabled:
+             self.reporter.stage("Grouping similar images", None)
+             result.duplicate_groups = assign_duplicate_groups(
+-                records,
++                shots,
+                 duplicates.hamming_threshold if duplicates.enabled else None,
+                 bursts,
+             )
+@@ -247,6 +258,7 @@ class Pipeline:
+         for record in records:
+             if record.status == "valid":
+                 record.scores = score_record(record, self.settings)
+-        rank_collection(records)
++        rank_collection(shots)
+         apply_recommendations(records, self.settings.thresholds)
+-        select_best_shots(records, self.settings.selection)
++        select_best_shots(shots, self.settings.selection)
++        inherit_companion_decisions(records)
+diff --git a/src/media_culler/reporting.py b/src/media_culler/reporting.py
+index 5d8432b..1508986 100644
+--- a/src/media_culler/reporting.py
++++ b/src/media_culler/reporting.py
+@@ -17,8 +17,8 @@ from media_culler.exceptions import ReportError
+ from media_culler.models import GroupKind, GroupRole, ImageRecord, Recommendation
+ from media_culler.pipeline import RunResult
+ 
+-SCHEMA_VERSION = 3
+-_READABLE_SCHEMAS = {2, 3}  # v3 only adds fields; v2 reports load with defaults
++SCHEMA_VERSION = 4
++_READABLE_SCHEMAS = {2, 3, 4}  # v3/v4 only add fields; older reports load with defaults
+ 
+ 
+ class TopImage(BaseModel):
+@@ -92,7 +92,9 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int
+         recommendations=dict(sorted(counts.items())),
+         duplicate_groups=duplicate_groups,
+         images_in_duplicate_groups=sum(1 for r in valid if r.duplicate_group is not None),
+-        redundant_images=sum(1 for r in valid if r.group_role == GroupRole.SIMILAR),
++        redundant_images=sum(
++            1 for r in valid if r.group_role == GroupRole.SIMILAR and r.paired_with is None
++        ),
+         mean_score=round(statistics.fmean(values), 2) if values else None,
+         median_score=round(statistics.median(values), 2) if values else None,
+         analyzer_failures=failures,
+@@ -166,6 +168,7 @@ CSV_COLUMNS = [
+     "closed_eyes",
+     "duplicate_group",
+     "group_kind",
++    "paired_with",
+     "captured_at",
+     "group_role",
+     "width",
+@@ -195,6 +198,7 @@ def _csv_row(r: ImageRecord) -> dict[str, Any]:
+         "closed_eyes": len(s.group.closed_eyes) if s and s.group else None,
+         "duplicate_group": r.duplicate_group,
+         "group_kind": r.group_kind.value if r.group_kind else "",
++        "paired_with": r.paired_with or "",
+         "captured_at": r.captured_at or "",
+         "group_role": r.group_role.value if r.group_role else "",
+         "width": r.width,
+diff --git a/tests/test_raw.py b/tests/test_raw.py
+new file mode 100644
+index 0000000..4e13af3
+--- /dev/null
++++ b/tests/test_raw.py
+@@ -0,0 +1,237 @@
++"""RAW decoding (rawpy faked: no real RAW sample ships with the tests) and RAW+JPEG pairs."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++from tests.conftest import save, save_timed, textured
++
++from media_culler import imaging
++from media_culler.analyzers.technical import TechnicalAnalyzer
++from media_culler.exceptions import ImageLoadError
++from media_culler.models import GroupRole, ImageRecord, Recommendation
++from media_culler.pairing import inherit_companion_decisions, link_raw_companions
++from media_culler.pipeline import Pipeline
++from media_culler.reporting import build_report
++
++WHEN = "2026:06:12 07:07:26"
++
++
++class FakeRawpy:
++    """Just enough of rawpy's surface: imread() context manager, sizes, postprocess, thumb."""
++
++    ThumbFormat = SimpleNamespace(JPEG="jpeg", BITMAP="bitmap")
++
++    def __init__(self, image: np.ndarray, *, flip: int = 0, thumb: bytes | None = None) -> None:
++        self.image, self.flip, self.thumb = image, flip, thumb
++        self.postprocess_kwargs: dict[str, object] = {}
++        self.opened: list[str] = []
++
++    def imread(self, path: str) -> FakeRawpy:
++        if path.endswith("broken.cr2"):
++            raise OSError("LibRaw: unsupported file format")
++        self.opened.append(path)
++        return self
++
++    def __enter__(self) -> FakeRawpy:
++        return self
++
++    def __exit__(self, *exc: object) -> None:
++        return None
++
++    @property
++    def sizes(self) -> SimpleNamespace:
++        height, width = self.image.shape[:2]
++        return SimpleNamespace(width=width, height=height, flip=self.flip)
++
++    def postprocess(self, **kwargs: object) -> np.ndarray:
++        self.postprocess_kwargs = kwargs
++        return self.image
++
++    def extract_thumb(self) -> SimpleNamespace:
++        if self.thumb is None:
++            raise OSError("no thumbnail")
++        return SimpleNamespace(format="jpeg", data=self.thumb)
++
++
++@pytest.fixture
++def fake_raw(monkeypatch: pytest.MonkeyPatch):
++    def install(image: np.ndarray, **kwargs: object) -> FakeRawpy:
++        fake = FakeRawpy(image, **kwargs)  # type: ignore[arg-type]
++        monkeypatch.setattr(imaging, "rawpy", fake, raising=False)
++        monkeypatch.setattr(imaging, "RAW_AVAILABLE", True)
++        monkeypatch.setattr(imaging, "_raw_half_size", False)
++        return fake
++
++    return install
++
++
++def raw_file(path: Path) -> Path:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_bytes(b"not really a raw file")
++    return path
++
++
++def test_raw_is_decoded_with_rawpy_not_pillow(tmp_path, fake_raw):
++    image = textured(1, (320, 240))
++    fake = fake_raw(image)
++    rgb = imaging.load_rgb(raw_file(tmp_path / "a.CR2"), 10_000_000)
++    assert rgb.shape == (240, 320, 3) and rgb.dtype == np.uint8
++    assert rgb.flags["C_CONTIGUOUS"] and np.array_equal(rgb, image)
++    assert fake.postprocess_kwargs == {"use_camera_wb": True, "half_size": False, "output_bps": 8}
++
++
++def test_half_size_is_configurable(tmp_path, fake_raw):
++    fake = fake_raw(textured(1, (320, 240)))
++    imaging.configure_raw(True)
++    try:
++        imaging.load_rgb(raw_file(tmp_path / "a.nef"), 10_000_000)
++    finally:
++        imaging.configure_raw(False)
++    assert fake.postprocess_kwargs["half_size"] is True
++
++
++def test_header_reports_dimensions_orientation_and_capture_time(tmp_path, fake_raw):
++    preview = tmp_path / "preview.png"
++    save_timed(textured(2, (64, 48)), preview, WHEN, "40")
++    fake_raw(textured(1, (320, 240)), flip=6, thumb=preview.read_bytes())
++    header = imaging.read_header(raw_file(tmp_path / "a.dng"), 10_000_000)
++    assert (header.width, header.height, header.format) == (240, 320, "RAW")  # 90-degree flip
++    assert header.captured_at == "2026-06-12T07:07:26.400000"
++
++
++def test_header_without_any_exif_has_no_time_rather_than_a_guess(tmp_path, fake_raw):
++    fake_raw(textured(1, (320, 240)))
++    header = imaging.read_header(raw_file(tmp_path / "a.arw"), 10_000_000)
++    assert header.captured_at is None and (header.width, header.height) == (320, 240)
++
++
++def test_size_limit_applies_to_raw(tmp_path, fake_raw):
++    fake_raw(textured(1, (320, 240)))
++    path = raw_file(tmp_path / "a.raf")
++    with pytest.raises(ImageLoadError, match="too large"):
++        imaging.read_header(path, 1000)
++    with pytest.raises(ImageLoadError, match="too large"):
++        imaging.load_rgb(path, 1000)
++
++
++def test_corrupt_raw_is_a_per_file_error(tmp_path, fake_raw):
++    fake_raw(textured(1, (320, 240)))
++    path = raw_file(tmp_path / "broken.cr2")
++    with pytest.raises(ImageLoadError, match="Cannot open RAW"):
++        imaging.read_header(path, 10_000_000)
++    with pytest.raises(ImageLoadError, match="Cannot decode RAW"):
++        imaging.load_rgb(path, 10_000_000)
++
++
++def test_missing_rawpy_gives_an_actionable_error_instead_of_a_misleading_preview(
++    tmp_path, monkeypatch
++):
++    monkeypatch.setattr(imaging, "RAW_AVAILABLE", False)
++    path = raw_file(tmp_path / "a.cr3")
++    for call in (imaging.read_header, imaging.load_rgb):
++        with pytest.raises(ImageLoadError, match=r"pip install 'ai-media-culler\[formats\]'"):
++            call(path, 10_000_000)
++
++
++def test_non_raw_files_never_touch_rawpy(tmp_path, fake_raw):
++    fake = fake_raw(textured(1, (320, 240)))
++    path = save(textured(3, (64, 48)), tmp_path / "a.png")
++    imaging.load_rgb(path, 10_000_000)
++    imaging.read_header(path, 10_000_000)
++    assert fake.opened == []
++
++
++# ------------------------------------------------------------------------- pairing
++
++
++def rec(relative: str, *, status: str = "valid", at: str | None = None) -> ImageRecord:
++    return ImageRecord(
++        path=f"/photos/{relative}",
++        relative_path=relative,
++        filename=Path(relative).name,
++        extension=Path(relative).suffix,
++        status=status,  # type: ignore[arg-type]
++        captured_at=at,
++    )
++
++
++def test_pairs_match_on_folder_and_stem_case_insensitively():
++    records = [
++        rec("trip/IMG_1.CR2"),
++        rec("trip/img_1.jpg"),
++        rec("trip/IMG_2.jpg"),  # no RAW
++        rec("other/IMG_1.jpg"),  # same stem, different folder
++    ]
++    assert link_raw_companions(records) == 1
++    assert [r.paired_with for r in records] == [None, "trip/IMG_1.CR2", None, None]
++
++
++def test_a_failed_raw_does_not_swallow_its_jpeg():
++    records = [rec("a.cr2", status="error"), rec("a.jpg")]
++    assert link_raw_companions(records) == 0 and records[1].paired_with is None
++
++
++def test_same_name_but_different_moment_is_not_a_pair():
++    records = [
++        rec("a.nef", at="2026-06-12T07:07:26"),
++        rec("a.jpg", at="2026-06-12T09:30:00"),  # counter rolled over
++    ]
++    assert link_raw_companions(records) == 0
++    near = [rec("b.nef", at="2026-06-12T07:07:26"), rec("b.jpg", at="2026-06-12T07:07:27")]
++    assert link_raw_companions(near) == 1
++
++
++def test_relinking_clears_stale_links():
++    records = [rec("a.cr2"), rec("a.jpg")]
++    link_raw_companions(records)
++    records[0].status = "error"
++    link_raw_companions(records)
++    assert records[1].paired_with is None
++
++
++def test_companion_inherits_decisions():
++    raw, jpg = rec("a.cr2"), rec("a.jpg")
++    raw.recommendation, raw.recommendation_reason = Recommendation.REVIEW, "why"
++    raw.group_role, raw.is_group_representative = GroupRole.SIMILAR, False
++    raw.selection_reason = "Closed eyes on 1 face(s)"
++    link_raw_companions([raw, jpg])
++    inherit_companion_decisions([raw, jpg])
++    assert jpg.recommendation is Recommendation.REVIEW and jpg.group_role is GroupRole.SIMILAR
++    assert jpg.is_group_representative is False
++    assert (
++        jpg.selection_reason
++        == "Companion of a.cr2; follows its decision (Closed eyes on 1 face(s))"
++    )
++
++
++def test_raw_plus_jpeg_is_one_shot_not_a_burst(settings, tmp_path, fake_raw):
++    frame = textured(7, (640, 480))
++    root = tmp_path / "in"
++    save_timed(frame, root / "IMG_0001.JPG", WHEN, "10")
++    raw_file(root / "IMG_0001.CR2")
++    preview = tmp_path / "p.png"
++    save_timed(textured(2, (64, 48)), preview, WHEN, "10")
++    fake_raw(frame, thumb=preview.read_bytes())
++
++    off = settings.model_copy(deep=True)
++    off.scan.pair_raw_jpeg = False
++    unpaired = Pipeline(off, analyzers=[TechnicalAnalyzer()]).run(root)
++    assert {r.filename for r in unpaired.records if r.duplicate_group} == {
++        "IMG_0001.JPG",
++        "IMG_0001.CR2",
++    }, "premise: without pairing the two files look like a duplicate group"
++
++    result = Pipeline(settings, analyzers=[TechnicalAnalyzer()]).run(root)
++    by = {r.filename: r for r in result.records}
++    assert all(r.status == "valid" for r in by.values())
++    assert by["IMG_0001.JPG"].paired_with == "IMG_0001.CR2"
++    assert result.duplicate_groups == 0
++    assert all(r.duplicate_group is None for r in by.values())
++    assert by["IMG_0001.JPG"].recommendation == by["IMG_0001.CR2"].recommendation
++
++    report = build_report(result)
++    assert report.summary.redundant_images == 0 and report.summary.duplicate_groups == 0
+-- 
+2.43.0
+
+
+From 10d9c89bd8ab9aaca8d367a0fb03ef1cbc0710cb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 08:09:00 +0000
+Subject: [PATCH 2/5] feat: verified, journalled and undoable organize;
+ sidecars; group folders
+
+- copies are checked against the SHA-256 recorded at analysis before being renamed
+  into place; a cross-device move deletes its source only after that check
+- every run is journalled (JSON Lines, fsynced, written before acting) to
+  <dest>/.culler/undo/; `culler undo` reverses it, dry run by default, and never
+  deletes a copy it cannot prove it made or whose original is gone
+- .xmp/.aae/.pp3/... sidecars and Live Photo videos travel with their photo and
+  follow its (collision-)renamed name
+- --group-folders puts each burst/duplicate group in its own folder; a RAW's JPEG
+  companion follows the RAW
+- warns when the destination is inside the scanned folder
+- replaces the single overwritten .culler_manifest.json with per-run journals
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ src/media_culler/cli.py           |  66 +++++-
+ src/media_culler/organizer.py     | 336 +++++++++++++++++++++++++++---
+ src/media_culler/ui/render.py     |   7 +-
+ tests/test_organizer_safety.py    | 244 ++++++++++++++++++++++
+ tests/test_reporting_organizer.py |   2 +-
+ 5 files changed, 621 insertions(+), 34 deletions(-)
+ create mode 100644 tests/test_organizer_safety.py
+
+diff --git a/src/media_culler/cli.py b/src/media_culler/cli.py
+index 6420de5..088c1de 100644
+--- a/src/media_culler/cli.py
++++ b/src/media_culler/cli.py
+@@ -20,7 +20,7 @@ from media_culler.doctor import run_checks
+ from media_culler.exceptions import ConfigError, CullerError
+ from media_culler.logging_setup import configure_logging
+ from media_culler.model_download import download_file
+-from media_culler.organizer import Mode, execute, plan_operations
++from media_culler.organizer import Mode, execute, latest_journal, plan_operations, undo_run
+ from media_culler.pipeline import Pipeline
+ from media_culler.reporting import build_report, load_report, write_reports
+ from media_culler.scanner import scan_directory
+@@ -295,6 +295,19 @@ def organize(
+             help="Don't route weaker duplicates to similar_alternates/.",
+         ),
+     ] = False,
++    group_folders: Annotated[
++        bool,
++        typer.Option(
++            "--group-folders",
++            help="Put each burst/duplicate group in its own folder, e.g. select/burst_0007/.",
++        ),
++    ] = False,
++    no_sidecars: Annotated[
++        bool,
++        typer.Option(
++            "--no-sidecars", help="Don't take .xmp/.aae files and Live Photo videos along."
++        ),
++    ] = False,
+     apply: Annotated[
+         bool, typer.Option("--apply", help="Actually do it. Without this it is a dry run.")
+     ] = False,
+@@ -317,6 +330,8 @@ def organize(
+         destination,
+         separate_duplicates=not keep_duplicates_in_place,
+         only=set(only) if only else None,
++        include_sidecars=not no_sidecars,
++        group_folders=group_folders,
+     )
+     if not ops:
+         console.print("[warn]Nothing to organize.[/]")
+@@ -324,6 +339,15 @@ def organize(
+ 
+     console.print(organize_plan_table(ops))
+     console.print(f"[muted]{mode.value} → {destination}[/]")
++    input_root = Path(loaded.input_directory).resolve()
++    if (
++        input_root in destination.resolve().parents
++        and destination.resolve() != settings.paths.output_directory.resolve()
++    ):
++        console.print(
++            "[warn]The destination is inside the scanned folder: a later `culler run` on it "
++            "will pick up the copies too. Use paths.output_directory or a folder outside.[/]"
++        )
+     if not apply:
+         console.print(
+             Panel(
+@@ -343,6 +367,8 @@ def organize(
+         raise typer.Exit(EXIT_ERROR)
+ 
+     outcome = execute(ops, mode, destination)
++    if outcome.journal:
++        console.print(f"[muted]Undo with: culler undo --dest {destination} --apply[/]")
+     console.print(
+         f"[ok]{len(outcome.done)} done[/] · {len(outcome.skipped)} skipped · "
+         f"[{'fail' if outcome.failed else 'muted'}]{len(outcome.failed)} failed[/]"
+@@ -353,6 +379,44 @@ def organize(
+         raise typer.Exit(EXIT_ERROR)
+ 
+ 
++@app.command()
++def undo(
++    dest: Annotated[
++        Path | None,
++        typer.Option("--dest", "-d", help="Destination root used by organize."),
++    ] = None,
++    journal: Annotated[
++        Path | None, typer.Option("--journal", help="A specific run (default: the latest).")
++    ] = None,
++    apply: Annotated[
++        bool, typer.Option("--apply", help="Actually do it. Without this it is a dry run.")
++    ] = False,
++    config: ConfigOpt = None,
++) -> None:
++    """Reverse the last `organize` run. Dry run by default; never deletes unverified files."""
++    settings = _load(config)
++    console = make_console()
++    destination = dest or settings.paths.output_directory
++    target = journal or latest_journal(destination)
++    if target is None or not target.exists():
++        console.print(f"[warn]No organize run to undo in {destination}.[/]")
++        raise typer.Exit(EXIT_ERROR)
++
++    outcome = undo_run(target, destination, apply=apply)
++    verb = "Reverted" if apply else "Would revert"
++    console.print(f"[ok]{verb} {len(outcome.reverted)}[/] · {len(outcome.skipped)} skipped")
++    for path, reason in outcome.skipped[:10]:
++        console.print(f"  [muted]{path.name}: {reason}[/]")
++    if not apply:
++        console.print(
++            Panel(
++                "Dry run: nothing was changed. Add [bold]--apply[/] to proceed.",
++                border_style="yellow",
++                box=box.ROUNDED,
++            )
++        )
++
++
+ # ---------------------------------------------------------------------------- models
+ 
+ 
+diff --git a/src/media_culler/organizer.py b/src/media_culler/organizer.py
+index e4dd7ec..3bc6467 100644
+--- a/src/media_culler/organizer.py
++++ b/src/media_culler/organizer.py
+@@ -1,25 +1,47 @@
+-"""Sort analysed photos into per-recommendation folders (copy / move / symlink).
++"""Sort analysed photos into per-recommendation folders (copy / move / symlink), and undo it.
+ 
+-Safe by construction: plans are pure, nothing is overwritten, copies are atomic, and
+-sources that vanished or changed since the report was written are skipped, not guessed at.
++Safe by construction:
++
++* plans are pure (the only filesystem reads are directory listings to find sidecars);
++* nothing is ever overwritten;
++* copies are written to a ``.part`` file, checked against the SHA-256 recorded at analysis
++  time, and only then renamed into place; a cross-device move deletes its source only after
++  that check passes;
++* sources that vanished or changed since the report was written are skipped, not guessed at;
++* every change is journalled to ``<dest>/.culler/undo/<run>.jsonl`` so ``culler undo`` can
++  reverse it, and undo refuses to delete a copy it cannot prove is the one it made.
+ """
+ 
+ from __future__ import annotations
+ 
++import errno
+ import json
+ import logging
+ import os
+ import shutil
+ from dataclasses import dataclass, field
++from datetime import datetime, timezone
+ from enum import Enum
+ from pathlib import Path
++from typing import Any
+ 
++from media_culler.imaging import sha256_file
+ from media_culler.models import GroupRole, ImageRecord
+ from media_culler.reporting import Report
+ 
+ log = logging.getLogger(__name__)
+ 
+ DUPLICATES_BUCKET = "similar_alternates"
++JOURNAL_DIR = Path(".culler") / "undo"
++UNDONE_SUFFIX = ".undone"
++
++# Files that belong to a photo and must travel with it. Matched case-insensitively as
++# ``<stem><suffix>`` (Lightroom, Apple, RawTherapee...) or ``<full name><suffix>``
++# (darktable: ``IMG_1.CR2.xmp``).
++SIDECAR_SUFFIXES = (".xmp", ".aae", ".pp3", ".dop", ".on1", ".thm")
++# An iPhone Live Photo is a still plus a same-named .mov.
++_LIVE_PHOTO_STILLS = frozenset({".heic", ".heif", ".jpg", ".jpeg"})
++_LIVE_PHOTO_VIDEO = ".mov"
+ 
+ 
+ class Mode(str, Enum):
+@@ -34,6 +56,8 @@ class Operation:
+     destination: Path
+     bucket: str
+     size_bytes: int
++    sha256: str | None = None  # content hash recorded at analysis; None for sidecars
++    kind: str = "photo"  # or "sidecar"
+ 
+ 
+ @dataclass
+@@ -41,6 +65,7 @@ class OrganizeResult:
+     done: list[Operation] = field(default_factory=list)
+     skipped: list[tuple[Operation, str]] = field(default_factory=list)
+     failed: list[tuple[Operation, str]] = field(default_factory=list)
++    journal: Path | None = None
+ 
+ 
+ def bucket_for(record: ImageRecord, separate_duplicates: bool) -> str | None:
+@@ -51,21 +76,76 @@ def bucket_for(record: ImageRecord, separate_duplicates: bool) -> str | None:
+     return record.recommendation.value
+ 
+ 
++def _group_folder(record: ImageRecord, by_path: dict[str, ImageRecord]) -> str | None:
++    """``burst_0007`` etc. for a grouped photo; a RAW's JPEG companion follows its RAW."""
++    owner = by_path.get(record.paired_with or "", record)
++    if owner.duplicate_group is None or owner.group_kind is None:
++        return None
++    return f"{owner.group_kind.value}_{owner.duplicate_group:04d}"
++
++
++class _Listings:
++    """Case-insensitive directory listings, read once each."""
++
++    def __init__(self) -> None:
++        self._cache: dict[Path, dict[str, Path]] = {}
++
++    def names(self, directory: Path) -> dict[str, Path]:
++        if directory not in self._cache:
++            try:
++                self._cache[directory] = {
++                    e.name.lower(): Path(e.path) for e in os.scandir(directory)
++                }
++            except OSError:
++                self._cache[directory] = {}
++        return self._cache[directory]
++
++
++def find_sidecars(photo: Path, listings: _Listings | None = None) -> list[Path]:
++    """Sidecar files sitting next to ``photo`` (existing files only, sorted)."""
++    names = (listings or _Listings()).names(photo.parent)
++    wanted = [photo.stem.lower() + suffix for suffix in SIDECAR_SUFFIXES]
++    wanted += [photo.name.lower() + suffix for suffix in SIDECAR_SUFFIXES]
++    if photo.suffix.lower() in _LIVE_PHOTO_STILLS:
++        wanted.append(photo.stem.lower() + _LIVE_PHOTO_VIDEO)
++    found = {names[w] for w in wanted if w in names and names[w] != photo}
++    return sorted(found)
++
++
++def _sidecar_target(photo: Path, target: Path, sidecar: Path) -> Path:
++    """Name the sidecar after wherever its photo ended up (collision suffixes included)."""
++    if sidecar.name.lower().startswith(photo.name.lower()):  # IMG_1.CR2.xmp
++        return target.with_name(target.name + sidecar.name[len(photo.name) :])
++    return target.with_name(target.stem + sidecar.suffix)  # IMG_1.xmp
++
++
+ def plan_operations(
+     report: Report,
+     destination: Path,
+     *,
+     separate_duplicates: bool = True,
+     only: set[str] | None = None,
++    include_sidecars: bool = True,
++    group_folders: bool = False,
+ ) -> list[Operation]:
+-    """Deterministic plan. Filename collisions get a short content-hash suffix."""
++    """Deterministic plan. Filename collisions get a short content-hash suffix.
++
++    ``include_sidecars`` brings along XMP/AAE/... files and Live Photo videos.
++    ``group_folders`` puts members of a burst/duplicate group in ``<bucket>/<kind>_<id>/``.
++    """
+     claimed: set[Path] = set()
++    claimed_sources: set[Path] = set()
++    listings = _Listings()
++    by_path = {r.relative_path: r for r in report.images}
+     ops: list[Operation] = []
+     for record in sorted(report.images, key=lambda r: r.path):
+         bucket = bucket_for(record, separate_duplicates)
+         if bucket is None or (only is not None and bucket not in only):
+             continue
+-        target = destination / bucket / record.filename
++        folder = destination / bucket
++        if group_folders and (name := _group_folder(record, by_path)):
++            folder = folder / name
++        target = folder / record.filename
+         if target in claimed:
+             suffix = (record.sha256 or "dup")[:8]
+             target = target.with_name(f"{target.stem}_{suffix}{target.suffix}")
+@@ -74,11 +154,74 @@ def plan_operations(
+             target = target.with_name(f"{target.stem}_{counter}{target.suffix}")
+             counter += 1
+         claimed.add(target)
+-        ops.append(Operation(Path(record.path), target, bucket, record.size_bytes))
++        source = Path(record.path)
++        claimed_sources.add(source)
++        ops.append(Operation(source, target, bucket, record.size_bytes, record.sha256))
++
++        if not include_sidecars:
++            continue
++        for sidecar in find_sidecars(source, listings):
++            if sidecar in claimed_sources:  # e.g. one IMG_1.xmp shared by a RAW and its JPEG
++                continue
++            side_target = _sidecar_target(source, target, sidecar)
++            if side_target in claimed:
++                continue
++            try:
++                size = sidecar.stat().st_size
++            except OSError:
++                continue
++            claimed.add(side_target)
++            claimed_sources.add(sidecar)
++            ops.append(Operation(sidecar, side_target, bucket, size, None, "sidecar"))
+     return ops
+ 
+ 
+-def _execute_one(op: Operation, mode: Mode) -> str | None:
++# ---------------------------------------------------------------------------- execute
++
++
++class _Journal:
++    """Append-only JSON Lines record of what a run did, flushed line by line."""
++
++    def __init__(self, destination: Path, mode: Mode) -> None:
++        directory = destination / JOURNAL_DIR
++        directory.mkdir(parents=True, exist_ok=True)
++        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
++        self.path = directory / f"{stamp}.jsonl"
++        counter = 1
++        while self.path.exists() or self.path.with_name(self.path.name + UNDONE_SUFFIX).exists():
++            self.path = directory / f"{stamp}_{counter}.jsonl"
++            counter += 1
++        self._handle = self.path.open("a", encoding="utf-8")
++        self.write({"event": "run", "version": 1, "mode": mode.value, "created_at": stamp})
++
++    def write(self, record: dict[str, Any]) -> None:
++        self._handle.write(json.dumps(record) + "\n")
++        self._handle.flush()
++        os.fsync(self._handle.fileno())
++
++    def close(self) -> None:
++        self._handle.close()
++
++
++def _verified_copy(source: Path, destination: Path, expected: str | None) -> str:
++    """Copy via a temp file, check it against ``expected``, then rename. Returns the hash."""
++    if expected is None:  # sidecars: no analysis-time hash, so hash the source first
++        expected = sha256_file(source)
++    partial = destination.with_name(destination.name + ".part")
++    try:
++        shutil.copy2(source, partial)
++        actual = sha256_file(partial)
++        if actual != expected:
++            raise OSError(
++                "copy does not match the analysed file (it changed, or the copy is corrupt)"
++            )
++        os.replace(partial, destination)
++    finally:
++        partial.unlink(missing_ok=True)
++    return expected
++
++
++def _execute_one(op: Operation, mode: Mode, journal: _Journal | None) -> str | None:
+     """Returns a skip reason, or None if the operation was performed."""
+     if not op.source.exists():
+         return "source missing"
+@@ -88,40 +231,171 @@ def _execute_one(op: Operation, mode: Mode) -> str | None:
+         return "destination exists"
+ 
+     op.destination.parent.mkdir(parents=True, exist_ok=True)
++    entry: dict[str, Any] = {
++        "source": str(op.source),
++        "destination": str(op.destination),
++        "mode": mode.value,
++        "kind": op.kind,
++        "size": op.size_bytes,
++    }
++    if journal:
++        journal.write({"event": "begin", **entry})  # before acting: a crash must be undoable
++
++    digest: str | None = None
+     if mode is Mode.SYMLINK:
+         os.symlink(op.source, op.destination)
+     elif mode is Mode.COPY:
+-        partial = op.destination.with_name(op.destination.name + ".part")
+-        try:
+-            shutil.copy2(op.source, partial)
+-            os.replace(partial, op.destination)
+-        finally:
+-            partial.unlink(missing_ok=True)
++        digest = _verified_copy(op.source, op.destination, op.sha256)
+     else:
+-        shutil.move(str(op.source), str(op.destination))
++        try:
++            os.rename(op.source, op.destination)  # same filesystem: atomic, no data moves
++        except OSError as error:
++            if error.errno != errno.EXDEV:
++                raise
++            digest = _verified_copy(op.source, op.destination, op.sha256)
++            op.source.unlink()  # only reached once the copy has been verified
++    if journal:
++        journal.write({"event": "done", **entry, "sha256": digest})
+     return None
+ 
+ 
+ def execute(ops: list[Operation], mode: Mode, destination: Path | None = None) -> OrganizeResult:
++    """Run a plan. With ``destination`` set, journal it so ``undo_run`` can reverse it."""
+     result = OrganizeResult()
+-    for op in ops:
++    journal = _Journal(destination, mode) if destination is not None and ops else None
++    try:
++        for op in ops:
++            try:
++                reason = _execute_one(op, mode, journal)
++            except OSError as error:
++                log.warning("Failed %s -> %s: %s", op.source, op.destination, error)
++                result.failed.append((op, str(error)))
++                continue
++            if reason:
++                result.skipped.append((op, reason))
++            else:
++                result.done.append(op)
++    finally:
++        if journal:
++            journal.close()
++    if journal:
++        if result.done:
++            result.journal = journal.path
++        else:
++            journal.path.unlink(missing_ok=True)  # nothing happened: nothing to undo
++    return result
++
++
++# ------------------------------------------------------------------------------ undo
++
++
++@dataclass
++class UndoResult:
++    reverted: list[Path] = field(default_factory=list)  # destinations undone
++    skipped: list[tuple[Path, str]] = field(default_factory=list)
++    journal: Path | None = None
++
++
++def latest_journal(destination: Path) -> Path | None:
++    directory = destination / JOURNAL_DIR
++    candidates = sorted(directory.glob("*.jsonl")) if directory.is_dir() else []
++    return candidates[-1] if candidates else None
++
++
++def _read_journal(path: Path) -> tuple[str, list[dict[str, Any]]]:
++    """Mode and the performed entries. A ``begin`` with no ``done`` only counts for moves
++    (a crash after the rename leaves the file moved but unconfirmed)."""
++    mode = Mode.COPY.value
++    begun: dict[str, dict[str, Any]] = {}
++    done: dict[str, dict[str, Any]] = {}
++    for line in path.read_text(encoding="utf-8").splitlines():
+         try:
+-            reason = _execute_one(op, mode)
++            record = json.loads(line)
++        except json.JSONDecodeError:
++            continue  # a torn final line from a crash
++        event = record.get("event")
++        if event == "run":
++            mode = record.get("mode", mode)
++        elif event == "begin":
++            begun[record["destination"]] = record
++        elif event == "done":
++            done[record["destination"]] = record
++    entries = list(done.values())
++    entries += [e for k, e in begun.items() if k not in done and e.get("mode") == "move"]
++    return mode, entries
++
++
++def _undo_one(entry: dict[str, Any], apply: bool) -> str | None:
++    """Returns a skip reason, or None if (or, in a dry run, if it would be) reverted."""
++    source, destination = Path(entry["source"]), Path(entry["destination"])
++    mode = entry.get("mode")
++
++    if mode == Mode.SYMLINK.value:
++        if not destination.is_symlink() or Path(os.readlink(destination)) != source:
++            return "not the link this run created"
++        if apply:
++            destination.unlink()
++        return None
++
++    if not destination.exists():
++        return "already gone"
++    if mode == Mode.COPY.value:
++        if not source.exists():
++            return "original is missing: keeping the copy as the only one"
++        recorded = entry.get("sha256")
++        if recorded is None or sha256_file(destination) != recorded:
++            return "copy was modified since it was made"
++        if apply:
++            destination.unlink()
++        return None
++
++    # move
++    if source.exists() or source.is_symlink():
++        return "original location is occupied"
++    if destination.stat().st_size != entry.get("size"):
++        return "file was modified since it was moved"
++    if entry.get("sha256") and sha256_file(destination) != entry["sha256"]:
++        return "file was modified since it was moved"
++    if apply:
++        source.parent.mkdir(parents=True, exist_ok=True)
++        try:
++            os.rename(destination, source)
+         except OSError as error:
+-            log.warning("Failed %s -> %s: %s", op.source, op.destination, error)
+-            result.failed.append((op, str(error)))
+-            continue
+-        if reason:
+-            result.skipped.append((op, reason))
++            if error.errno != errno.EXDEV:
++                raise
++            shutil.move(str(destination), str(source))
++    return None
++
++
++def _prune_empty_dirs(destination: Path, touched: list[Path]) -> None:
++    for directory in sorted({p.parent for p in touched}, key=lambda d: len(d.parts), reverse=True):
++        current = directory
++        while current != destination and destination in current.parents:
++            try:
++                current.rmdir()
++            except OSError:
++                break
++            current = current.parent
++
++
++def undo_run(journal: Path, destination: Path, *, apply: bool = False) -> UndoResult:
++    """Reverse one organize run. Dry run unless ``apply``. Never deletes what it cannot prove."""
++    _mode, entries = _read_journal(journal)
++    result = UndoResult()
++    for entry in reversed(entries):
++        target = Path(entry["destination"])
++        try:
++            reason = _undo_one(entry, apply)
++        except OSError as error:
++            reason = f"error: {error}"
++        if reason in (None,):
++            result.reverted.append(target)
+         else:
+-            result.done.append(op)
+-
+-    if destination is not None and result.done:
+-        manifest = destination / ".culler_manifest.json"
+-        entries = [
+-            {"source": str(o.source), "destination": str(o.destination), "mode": mode.value}
+-            for o in result.done
+-        ]
+-        manifest.parent.mkdir(parents=True, exist_ok=True)
+-        manifest.write_text(json.dumps(entries, indent=2), encoding="utf-8")
++            result.skipped.append((target, reason))
++    if apply:
++        _prune_empty_dirs(destination, result.reverted)
++        if not any(r for _, r in result.skipped if r.startswith("error")):
++            marked = journal.with_name(journal.name + UNDONE_SUFFIX)
++            journal.rename(marked)
++            result.journal = marked
+     return result
+diff --git a/src/media_culler/ui/render.py b/src/media_culler/ui/render.py
+index 9becdc8..0a179aa 100644
+--- a/src/media_culler/ui/render.py
++++ b/src/media_culler/ui/render.py
+@@ -188,13 +188,18 @@ def organize_plan_table(ops: list[Operation], limit: int = 15) -> Table:
+     table = Table(title=f"Plan ({len(ops)} files)", box=box.SIMPLE_HEAVY, title_justify="left")
+     table.add_column("Bucket")
+     table.add_column("Count", justify="right")
++    table.add_column("Sidecars", justify="right")
+     table.add_column("Size", justify="right")
+     buckets: dict[str, list[Operation]] = {}
+     for op in ops:
+         buckets.setdefault(op.bucket, []).append(op)
+     for bucket, items in sorted(buckets.items()):
+         style = "similar_alternates" if bucket == DUPLICATES_BUCKET else bucket
++        sidecars = sum(1 for o in items if o.kind == "sidecar")
+         table.add_row(
+-            Text(bucket, style=style), str(len(items)), human_size(sum(o.size_bytes for o in items))
++            Text(bucket, style=style),
++            str(len(items) - sidecars),
++            str(sidecars) if sidecars else "",
++            human_size(sum(o.size_bytes for o in items)),
+         )
+     return table
+diff --git a/tests/test_organizer_safety.py b/tests/test_organizer_safety.py
+new file mode 100644
+index 0000000..d1ea5aa
+--- /dev/null
++++ b/tests/test_organizer_safety.py
+@@ -0,0 +1,244 @@
++"""Verified copies, undo journal, sidecars and group folders."""
++
++from __future__ import annotations
++
++import errno
++import os
++from pathlib import Path
++
++import pytest
++from typer.testing import CliRunner
++
++from media_culler import organizer
++from media_culler.cli import app
++from media_culler.imaging import sha256_file
++from media_culler.models import GroupKind, GroupRole, ImageRecord, Recommendation
++from media_culler.organizer import (
++    Mode,
++    execute,
++    find_sidecars,
++    latest_journal,
++    plan_operations,
++    undo_run,
++)
++from media_culler.reporting import Report, build_summary
++
++
++def make_report(root: Path, names: list[str], **extra: object) -> Report:
++    images = []
++    for name in names:
++        path = root / name
++        path.parent.mkdir(parents=True, exist_ok=True)
++        if not path.exists():
++            path.write_bytes(f"content of {name}".encode())
++        images.append(
++            ImageRecord(
++                path=str(path),
++                relative_path=name,
++                filename=path.name,
++                extension=path.suffix,
++                size_bytes=path.stat().st_size,
++                sha256=sha256_file(path),
++                recommendation=Recommendation.SELECT,
++            )
++        )
++    return Report(
++        generated_at="now",
++        duration_seconds=0,
++        input_directory=str(root),
++        skipped_analyzers={},
++        summary=build_summary(images, 0),
++        images=images,
++    )
++
++
++@pytest.fixture
++def src(tmp_path: Path) -> Path:
++    return tmp_path / "src"
++
++
++def test_copy_is_verified_against_the_analysed_hash(src, tmp_path):
++    report = make_report(src, ["a.jpg"])
++    (src / "a.jpg").write_bytes(b"CONTENT OF a.jpg")  # same size, different bytes
++    ops = plan_operations(report, tmp_path / "out")
++    result = execute(ops, Mode.COPY, tmp_path / "out")
++    assert not result.done and "does not match" in result.failed[0][1]
++    assert not list((tmp_path / "out").rglob("a.jpg*"))  # no partial or final file left
++    assert result.journal is None
++
++
++def test_cross_device_move_deletes_the_source_only_after_verification(src, tmp_path, monkeypatch):
++    report = make_report(src, ["a.jpg", "b.jpg"])
++    real_rename = os.rename
++
++    def exdev(a, b):  # pretend the destination is another filesystem
++        raise OSError(errno.EXDEV, "cross-device")
++
++    monkeypatch.setattr(organizer.os, "rename", exdev)
++    ops = plan_operations(report, tmp_path / "out")
++    (src / "b.jpg").write_bytes(b"CONTENT OF b.jpg")  # changed after analysis, same size
++    result = execute(ops, Mode.MOVE, tmp_path / "out")
++    monkeypatch.setattr(organizer.os, "rename", real_rename)
++    assert [o.source.name for o in result.done] == ["a.jpg"]
++    assert not (src / "a.jpg").exists() and (tmp_path / "out/select/a.jpg").exists()
++    assert (src / "b.jpg").exists(), "unverified source must never be deleted"
++    assert result.failed and not (tmp_path / "out/select/b.jpg").exists()
++
++
++def test_undo_copy_removes_only_verified_copies(src, tmp_path):
++    out = tmp_path / "out"
++    report = make_report(src, ["a.jpg", "b.jpg", "c.jpg"])
++    result = execute(plan_operations(report, out), Mode.COPY, out)
++    (out / "select/b.jpg").write_bytes(b"edited after copy")
++    (src / "c.jpg").unlink()  # original gone: the copy is now the only one
++
++    dry = undo_run(result.journal, out)
++    assert (out / "select/a.jpg").exists(), "dry run changes nothing"
++    assert [p.name for p in dry.reverted] == ["a.jpg"]
++
++    done = undo_run(result.journal, out, apply=True)
++    reasons = {p.name: r for p, r in done.skipped}
++    assert reasons["b.jpg"] == "copy was modified since it was made"
++    assert reasons["c.jpg"].startswith("original is missing")
++    assert not (out / "select/a.jpg").exists()
++    assert (out / "select/b.jpg").exists() and (out / "select/c.jpg").exists()
++    assert done.journal and done.journal.name.endswith(".undone")
++    assert latest_journal(out) is None
++
++
++def test_undo_move_restores_and_refuses_to_clobber(src, tmp_path):
++    out = tmp_path / "out"
++    report = make_report(src, ["a.jpg", "b.jpg"])
++    result = execute(plan_operations(report, out), Mode.MOVE, out)
++    assert not (src / "a.jpg").exists()
++    (src / "b.jpg").write_bytes(b"someone put a new file here")
++    done = undo_run(result.journal, out, apply=True)
++    assert (src / "a.jpg").read_bytes() == b"content of a.jpg"
++    assert (src / "b.jpg").read_bytes() == b"someone put a new file here"
++    assert dict((p.name, r) for p, r in done.skipped) == {"b.jpg": "original location is occupied"}
++    assert not (out / "select").exists() or any((out / "select").iterdir())
++
++
++def test_undo_symlinks_and_empty_folder_cleanup(src, tmp_path):
++    out = tmp_path / "out"
++    report = make_report(src, ["a.jpg"])
++    result = execute(plan_operations(report, out), Mode.SYMLINK, out)
++    if result.failed:
++        pytest.skip("symlinks unavailable")
++    undo_run(result.journal, out, apply=True)
++    assert not (out / "select").exists()
++
++
++def test_skipped_operations_are_not_journalled_so_undo_never_touches_them(src, tmp_path):
++    out = tmp_path / "out"
++    report = make_report(src, ["a.jpg", "b.jpg"])
++    ops = plan_operations(report, out)
++    (out / "select").mkdir(parents=True)
++    (out / "select/a.jpg").write_bytes(b"the user's own file")
++    result = execute(ops, Mode.COPY, out)
++    undo_run(result.journal, out, apply=True)
++    assert (out / "select/a.jpg").read_bytes() == b"the user's own file"
++
++
++def test_a_crash_after_a_move_is_still_undoable(src, tmp_path):
++    out = tmp_path / "out"
++    report = make_report(src, ["a.jpg"])
++    [op] = plan_operations(report, out)
++    journal = organizer._Journal(out, Mode.MOVE)
++    journal.write(
++        {
++            "event": "begin",
++            "source": str(op.source),
++            "destination": str(op.destination),
++            "mode": "move",
++            "kind": "photo",
++            "size": op.size_bytes,
++        }
++    )
++    op.destination.parent.mkdir(parents=True)
++    os.rename(op.source, op.destination)  # ...and the process dies before "done"
++    journal.close()
++    with journal.path.open("a") as handle:
++        handle.write('{"event": "begin", "sour')  # torn final line
++    undo_run(journal.path, out, apply=True)
++    assert op.source.exists()
++
++
++def test_sidecars_travel_with_their_photo(src, tmp_path):
++    for name in ("IMG_1.CR2", "IMG_1.xmp", "IMG_1.CR2.xmp", "IMG_1.AAE", "IMG_1.MOV", "IMG_2.jpg"):
++        (src).mkdir(exist_ok=True)
++        (src / name).write_bytes(name.encode())
++    assert [p.name for p in find_sidecars(src / "IMG_1.CR2")] == [
++        "IMG_1.AAE",
++        "IMG_1.CR2.xmp",
++        "IMG_1.xmp",
++    ]  # no Live Photo video for a RAW
++    assert "IMG_1.MOV" not in {p.name for p in find_sidecars(src / "IMG_1.CR2")}
++    assert "IMG_1.MOV" not in {p.name for p in find_sidecars(src / "IMG_2.jpg")}
++
++    (src / "IMG_3.heic").write_bytes(b"h")
++    (src / "IMG_3.mov").write_bytes(b"m")
++    assert [p.name for p in find_sidecars(src / "IMG_3.heic")] == ["IMG_3.mov"]
++
++    out = tmp_path / "out"
++    report = make_report(src, ["IMG_1.CR2", "IMG_2.jpg"])
++    ops = plan_operations(report, out)
++    names = sorted(o.destination.name for o in ops)
++    assert names == ["IMG_1.AAE", "IMG_1.CR2", "IMG_1.CR2.xmp", "IMG_1.xmp", "IMG_2.jpg"]
++    assert plan_operations(report, out, include_sidecars=False)[0].kind == "photo"
++    assert len(plan_operations(report, out, include_sidecars=False)) == 2
++    result = execute(ops, Mode.COPY, out)
++    assert len(result.done) == 5
++    undo_run(result.journal, out, apply=True)
++    assert not list(out.rglob("IMG_*"))
++
++
++def test_a_sidecar_shared_by_a_raw_and_its_jpeg_is_taken_once(src, tmp_path):
++    (src).mkdir()
++    (src / "IMG_1.xmp").write_bytes(b"x")
++    report = make_report(src, ["IMG_1.CR2", "IMG_1.JPG"])
++    ops = plan_operations(report, tmp_path / "out")
++    assert [o.kind for o in ops].count("sidecar") == 1
++
++
++def test_sidecar_follows_a_renamed_photo(src, tmp_path):
++    report = make_report(src, ["a/x.jpg", "b/x.jpg"])
++    (src / "b/x.xmp").write_bytes(b"x")
++    ops = plan_operations(report, tmp_path / "out")
++    photo = next(o for o in ops if o.source == src / "b/x.jpg")
++    sidecar = next(o for o in ops if o.kind == "sidecar")
++    assert photo.destination.stem != "x"  # collision suffix applied
++    assert sidecar.destination.stem == photo.destination.stem
++
++
++def test_group_folders_include_a_raw_companions(src, tmp_path):
++    report = make_report(src, ["a.CR2", "a.jpg", "solo.jpg"])
++    raw, companion, _solo = report.images
++    raw.duplicate_group, raw.group_kind = 7, GroupKind.BURST
++    companion.paired_with = raw.relative_path
++    raw.group_role = GroupRole.REPRESENTATIVE
++    out = tmp_path / "out"
++    flat = {o.destination.parent.name for o in plan_operations(report, out)}
++    assert flat == {"select"}
++    grouped = plan_operations(report, out, group_folders=True)
++    folders = {o.source.name: o.destination.parent.name for o in grouped}
++    assert folders == {"a.CR2": "burst_0007", "a.jpg": "burst_0007", "solo.jpg": "select"}
++
++
++def test_cli_undo_roundtrip_and_dry_run_default(src, tmp_path):
++    from media_culler.reporting import write_reports
++
++    out = tmp_path / "out"
++    report = make_report(src, ["a.jpg"])
++    report_path = write_reports(report, tmp_path / "r", {"json"})["json"]
++    runner = CliRunner()
++    done = runner.invoke(app, ["organize", str(report_path), "--dest", str(out), "--apply"])
++    assert done.exit_code == 0 and "culler undo" in done.output
++    assert (out / "select/a.jpg").exists()
++    dry = runner.invoke(app, ["undo", "--dest", str(out)])
++    assert dry.exit_code == 0 and (out / "select/a.jpg").exists() and "Dry run" in dry.output
++    real = runner.invoke(app, ["undo", "--dest", str(out), "--apply"])
++    assert real.exit_code == 0 and not (out / "select/a.jpg").exists()
++    assert (src / "a.jpg").exists()
++    again = runner.invoke(app, ["undo", "--dest", str(out)])
++    assert again.exit_code != 0 and "No organize run" in again.output
+diff --git a/tests/test_reporting_organizer.py b/tests/test_reporting_organizer.py
+index 6d6d375..43b94c9 100644
+--- a/tests/test_reporting_organizer.py
++++ b/tests/test_reporting_organizer.py
+@@ -86,7 +86,7 @@ def test_copy_leaves_sources_and_is_idempotent(report, tmp_path):
+     ops = plan_operations(report, dest)
+     first = execute(ops, Mode.COPY, dest)
+     assert len(first.done) == 3 and all(o.source.exists() and o.destination.exists() for o in ops)
+-    assert (dest / ".culler_manifest.json").exists()
++    assert first.journal and first.journal.parent == dest / ".culler" / "undo"
+     again = execute(ops, Mode.COPY, dest)
+     assert not again.done and {r for _, r in again.skipped} == {"destination exists"}
+     assert not list(dest.rglob("*.part"))
+-- 
+2.43.0
+
+
+From 2c9e1bb32965f7c3df6c94f35f97af574e7e2133 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 08:11:17 +0000
+Subject: [PATCH 3/5] feat: culler eval - measure decisions against your own
+ labels
+
+Adds a labels.csv format (verdict, scene, closed_eyes, group/best, all optional)
+and `culler eval REPORT LABELS`: false-reject rate, keep/reject precision and
+recall, scene accuracy, closed-eye precision/recall and best-of-group hit rate,
+with a Rich summary and --json output. `--init` writes a blank template.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ src/media_culler/cli.py              |  38 ++++
+ src/media_culler/data/culler.tldr.md |  12 ++
+ src/media_culler/evaluation.py       | 304 +++++++++++++++++++++++++++
+ src/media_culler/ui/render.py        |  64 ++++++
+ tests/test_evaluation.py             | 180 ++++++++++++++++
+ 5 files changed, 598 insertions(+)
+ create mode 100644 src/media_culler/evaluation.py
+ create mode 100644 tests/test_evaluation.py
+
+diff --git a/src/media_culler/cli.py b/src/media_culler/cli.py
+index 088c1de..aacf700 100644
+--- a/src/media_culler/cli.py
++++ b/src/media_culler/cli.py
+@@ -17,6 +17,7 @@ from rich.table import Table
+ from media_culler import __version__
+ from media_culler.config import DEFAULT_CONFIG_YAML, Settings, load_settings
+ from media_culler.doctor import run_checks
++from media_culler.evaluation import evaluate, load_labels, write_template
+ from media_culler.exceptions import ConfigError, CullerError
+ from media_culler.logging_setup import configure_logging
+ from media_culler.model_download import download_file
+@@ -29,6 +30,7 @@ from media_culler.ui.progress import RichReporter
+ from media_culler.ui.render import (
+     human_size,
+     organize_plan_table,
++    print_evaluation,
+     print_results,
+ )
+ 
+@@ -417,6 +419,42 @@ def undo(
+         )
+ 
+ 
++@app.command("eval")
++def eval_command(
++    report_file: Annotated[Path, typer.Argument(help="inventory.json from `culler run`.")],
++    labels_file: Annotated[Path, typer.Argument(help="Your labels CSV (see --init).")],
++    init: Annotated[
++        bool,
++        typer.Option(
++            "--init", help="Write a blank labels CSV listing the report's photos, then exit."
++        ),
++    ] = False,
++    json_out: Annotated[
++        Path | None, typer.Option("--json", help="Also write the metrics as JSON.")
++    ] = None,
++) -> None:
++    """Compare the tool's decisions with your own labels (precision, recall, best-shot hit rate)."""
++    console = make_console()
++    try:
++        loaded = load_report(report_file)
++        if init:
++            if labels_file.exists():
++                console.print(f"[warn]{labels_file} exists; not overwriting it.[/]")
++                raise typer.Exit(EXIT_ERROR)
++            count = write_template(loaded, labels_file)
++            console.print(
++                f"[ok]Wrote {count} rows to {labels_file}[/] · fill in the columns you care about."
++            )
++            return
++        result = evaluate(loaded, load_labels(labels_file))
++    except CullerError as error:
++        raise _fail(error) from error
++    print_evaluation(console, result)
++    if json_out:
++        json_out.parent.mkdir(parents=True, exist_ok=True)
++        json_out.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
++
++
+ # ---------------------------------------------------------------------------- models
+ 
+ 
+diff --git a/src/media_culler/data/culler.tldr.md b/src/media_culler/data/culler.tldr.md
+index a590d39..8668a4f 100644
+--- a/src/media_culler/data/culler.tldr.md
++++ b/src/media_culler/data/culler.tldr.md
+@@ -25,6 +25,18 @@
+ 
+ `culler organize reports/inventory.json --dest {{path/to/sorted}} --apply`
+ 
++- Keep each burst in its own folder, or reverse the last organize run:
++
++`culler organize reports/inventory.json --dest {{path/to/sorted}} --group-folders --apply`
++
++`culler undo --dest {{path/to/sorted}} --apply`
++
++- Measure the tool against your own picks (fill in the generated CSV, then compare):
++
++`culler eval reports/inventory.json {{labels.csv}} --init`
++
++`culler eval reports/inventory.json {{labels.csv}}`
++
+ - Re-display the last report without re-analysing:
+ 
+ `culler report`
+diff --git a/src/media_culler/evaluation.py b/src/media_culler/evaluation.py
+new file mode 100644
+index 0000000..b71e720
+--- /dev/null
++++ b/src/media_culler/evaluation.py
+@@ -0,0 +1,304 @@
++"""Score the tool's decisions against your own labels, so tuning is measured, not guessed.
++
++You label a few hundred photos in a CSV; ``culler eval REPORT LABELS`` compares them with
++the report. Every column except ``path`` is optional, and blank cells are ignored, so you
++can label only what you care about:
++
++=============  =====================================================================
++``path``       the report's ``relative_path`` (or a file name, if unambiguous)
++``verdict``    ``keep`` or ``reject``: would you keep this photo?
++``scene``      ``people`` / ``landscape`` / ``general``
++``closed_eyes``  ``1``/``0`` (or yes/no): is a subject's eye closed?
++``group``      any id: frames you consider one burst / near-duplicate set
++``best``       ``1`` on the frame you would keep from that ``group``
++=============  =====================================================================
++"""
++
++from __future__ import annotations
++
++import csv
++from collections import Counter, defaultdict
++from dataclasses import asdict, dataclass, field
++from pathlib import Path
++
++from media_culler.exceptions import CullerError
++from media_culler.models import GroupRole, ImageRecord, Recommendation
++from media_culler.reporting import Report
++
++LABEL_COLUMNS = ("path", "verdict", "scene", "closed_eyes", "group", "best")
++_TRUE = {"1", "true", "yes", "y", "closed"}
++_FALSE = {"0", "false", "no", "n", "open"}
++_VERDICTS = {"keep", "reject"}
++_SCENES = {"people", "landscape", "general"}
++
++
++class LabelError(CullerError):
++    """The labels file cannot be used."""
++
++
++@dataclass
++class Label:
++    path: str
++    verdict: str | None = None
++    scene: str | None = None
++    closed_eyes: bool | None = None
++    group: str | None = None
++    best: bool = False
++
++
++@dataclass
++class VerdictStats:
++    labelled: int = 0
++    # human verdict -> tool decision ("keep" = select/usable, "review", "reject")
++    matrix: dict[str, dict[str, int]] = field(default_factory=dict)
++    false_reject_rate: float | None = None  # kept by you, rejected by the tool: the costly error
++    keep_recall: float | None = None  # of your keepers, share the tool also keeps
++    keep_precision: float | None = None  # of the tool's keeps, share you also keep
++    reject_recall: float | None = None  # of your rejects, share the tool flags
++    review_rate: float | None = None  # share the tool leaves to you
++    undecided: int = 0  # tool had no score
++
++
++@dataclass
++class DetectionStats:
++    labelled: int = 0
++    tp: int = 0
++    fp: int = 0
++    fn: int = 0
++    tn: int = 0
++    precision: float | None = None
++    recall: float | None = None
++
++
++@dataclass
++class SceneStats:
++    labelled: int = 0
++    accuracy: float | None = None
++    confusion: dict[str, dict[str, int]] = field(default_factory=dict)
++
++
++@dataclass
++class BestShotStats:
++    groups: int = 0
++    best_kept: int = 0  # your pick survived (was not set aside as an alternate)
++    picked_exactly: int = 0  # ...and it is the ONLY frame of the group the tool kept
++    best_kept_rate: float | None = None
++    picked_exactly_rate: float | None = None
++    misses: list[str] = field(default_factory=list)  # groups where your best was dropped
++
++
++@dataclass
++class EvalResult:
++    labelled: int
++    matched: int
++    unmatched: list[str]
++    verdict: VerdictStats
++    scene: SceneStats
++    closed_eyes: DetectionStats
++    best_shot: BestShotStats
++
++    def to_dict(self) -> dict[str, object]:
++        return asdict(self)
++
++
++def _ratio(num: int, den: int) -> float | None:
++    return round(num / den, 4) if den else None
++
++
++def _flag(value: str, column: str, row: int) -> bool | None:
++    text = value.strip().lower()
++    if not text:
++        return None
++    if text in _TRUE:
++        return True
++    if text in _FALSE:
++        return False
++    raise LabelError(f"labels row {row}: {column} must be 1/0 or yes/no, got {value!r}")
++
++
++def load_labels(path: Path) -> list[Label]:
++    if not path.exists():
++        raise LabelError(f"Labels file not found: {path}")
++    try:
++        with path.open(encoding="utf-8-sig", newline="") as handle:
++            reader = csv.DictReader(handle)
++            if not reader.fieldnames or "path" not in [f.strip() for f in reader.fieldnames]:
++                raise LabelError("labels file needs a header row with a 'path' column")
++            rows = list(reader)
++    except (OSError, UnicodeDecodeError, csv.Error) as error:
++        raise LabelError(f"Cannot read labels file: {error}") from error
++
++    labels: list[Label] = []
++    seen: set[str] = set()
++    for number, raw in enumerate(rows, start=2):
++        row = {(k or "").strip(): (v or "").strip() for k, v in raw.items()}
++        name = row.get("path", "")
++        if not name:
++            continue
++        if name in seen:
++            raise LabelError(f"labels row {number}: {name!r} is listed twice")
++        seen.add(name)
++        verdict = row.get("verdict", "").lower() or None
++        if verdict is not None and verdict not in _VERDICTS:
++            raise LabelError(
++                f"labels row {number}: verdict must be keep or reject, got {verdict!r}"
++            )
++        scene = row.get("scene", "").lower() or None
++        if scene is not None and scene not in _SCENES:
++            raise LabelError(f"labels row {number}: scene must be one of {sorted(_SCENES)}")
++        labels.append(
++            Label(
++                path=name,
++                verdict=verdict,
++                scene=scene,
++                closed_eyes=_flag(row.get("closed_eyes", ""), "closed_eyes", number),
++                group=row.get("group") or None,
++                best=bool(_flag(row.get("best", ""), "best", number)),
++            )
++        )
++    return labels
++
++
++def write_template(report: Report, path: Path) -> int:
++    """Labels file listing every valid image, ready to fill in."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    rows = [r for r in report.images if r.status == "valid"]
++    with path.open("w", encoding="utf-8", newline="") as handle:
++        writer = csv.writer(handle)
++        writer.writerow(LABEL_COLUMNS)
++        for record in sorted(rows, key=lambda r: r.relative_path):
++            writer.writerow([record.relative_path, "", "", "", "", ""])
++    return len(rows)
++
++
++def _index(
++    records: list[ImageRecord],
++) -> tuple[dict[str, ImageRecord], dict[str, list[ImageRecord]]]:
++    by_path = {r.relative_path: r for r in records}
++    by_name: dict[str, list[ImageRecord]] = defaultdict(list)
++    for record in records:
++        by_name[record.filename].append(record)
++    return by_path, by_name
++
++
++def _tool_decision(record: ImageRecord) -> str | None:
++    if record.recommendation in (Recommendation.SELECT, Recommendation.USABLE):
++        return "keep"
++    if record.recommendation is Recommendation.REVIEW:
++        return "review"
++    if record.recommendation is Recommendation.REJECT:
++        return "reject"
++    return None
++
++
++def _kept_as_best(record: ImageRecord) -> bool:
++    return record.group_role is not GroupRole.SIMILAR
++
++
++def evaluate(report: Report, labels: list[Label]) -> EvalResult:
++    valid = [r for r in report.images if r.status == "valid"]
++    by_path, by_name = _index(valid)
++    matched: list[tuple[Label, ImageRecord]] = []
++    unmatched: list[str] = []
++    for label in labels:
++        record = by_path.get(label.path)
++        if record is None:
++            candidates = by_name.get(Path(label.path).name, [])
++            record = candidates[0] if len(candidates) == 1 else None
++        if record is None:
++            unmatched.append(label.path)
++        else:
++            matched.append((label, record))
++
++    return EvalResult(
++        labelled=len(labels),
++        matched=len(matched),
++        unmatched=unmatched,
++        verdict=_verdicts(matched),
++        scene=_scenes(matched),
++        closed_eyes=_closed_eyes(matched),
++        best_shot=_best_shots(matched),
++    )
++
++
++def _verdicts(matched: list[tuple[Label, ImageRecord]]) -> VerdictStats:
++    stats = VerdictStats()
++    matrix: dict[str, Counter[str]] = {"keep": Counter(), "reject": Counter()}
++    for label, record in matched:
++        if label.verdict is None:
++            continue
++        decision = _tool_decision(record)
++        if decision is None:
++            stats.undecided += 1
++            continue
++        stats.labelled += 1
++        matrix[label.verdict][decision] += 1
++    stats.matrix = {k: dict(v) for k, v in matrix.items()}
++    keep_row, reject_row = matrix["keep"], matrix["reject"]
++    keepers, rejects = sum(keep_row.values()), sum(reject_row.values())
++    tool_keeps = keep_row["keep"] + reject_row["keep"]
++    stats.false_reject_rate = _ratio(keep_row["reject"], keepers)
++    stats.keep_recall = _ratio(keep_row["keep"], keepers)
++    stats.keep_precision = _ratio(keep_row["keep"], tool_keeps)
++    stats.reject_recall = _ratio(reject_row["reject"], rejects)
++    stats.review_rate = _ratio(keep_row["review"] + reject_row["review"], keepers + rejects)
++    return stats
++
++
++def _scenes(matched: list[tuple[Label, ImageRecord]]) -> SceneStats:
++    stats = SceneStats()
++    confusion: dict[str, Counter[str]] = defaultdict(Counter)
++    correct = 0
++    for label, record in matched:
++        if label.scene is None or record.scores is None or record.scores.scene_type is None:
++            continue
++        predicted = record.scores.scene_type.value
++        stats.labelled += 1
++        confusion[label.scene][predicted] += 1
++        correct += predicted == label.scene
++    stats.accuracy = _ratio(correct, stats.labelled)
++    stats.confusion = {k: dict(v) for k, v in confusion.items()}
++    return stats
++
++
++def _closed_eyes(matched: list[tuple[Label, ImageRecord]]) -> DetectionStats:
++    stats = DetectionStats()
++    for label, record in matched:
++        if label.closed_eyes is None or record.scores is None:
++            continue
++        flagged = bool(record.scores.group and record.scores.group.closed_eyes)
++        stats.labelled += 1
++        if label.closed_eyes and flagged:
++            stats.tp += 1
++        elif label.closed_eyes:
++            stats.fn += 1
++        elif flagged:
++            stats.fp += 1
++        else:
++            stats.tn += 1
++    stats.precision = _ratio(stats.tp, stats.tp + stats.fp)
++    stats.recall = _ratio(stats.tp, stats.tp + stats.fn)
++    return stats
++
++
++def _best_shots(matched: list[tuple[Label, ImageRecord]]) -> BestShotStats:
++    stats = BestShotStats()
++    groups: dict[str, list[tuple[Label, ImageRecord]]] = defaultdict(list)
++    for label, record in matched:
++        if label.group:
++            groups[label.group].append((label, record))
++    for name, members in sorted(groups.items()):
++        bests = [record for label, record in members if label.best]
++        if len(bests) != 1 or len(members) < 2:
++            continue  # needs exactly one human pick among at least two frames
++        stats.groups += 1
++        if _kept_as_best(bests[0]):
++            stats.best_kept += 1
++            kept = [r for _, r in members if _kept_as_best(r)]
++            if len(kept) == 1:
++                stats.picked_exactly += 1
++        else:
++            stats.misses.append(name)
++    stats.best_kept_rate = _ratio(stats.best_kept, stats.groups)
++    stats.picked_exactly_rate = _ratio(stats.picked_exactly, stats.groups)
++    return stats
+diff --git a/src/media_culler/ui/render.py b/src/media_culler/ui/render.py
+index 0a179aa..df13a99 100644
+--- a/src/media_culler/ui/render.py
++++ b/src/media_culler/ui/render.py
+@@ -10,6 +10,7 @@ from rich.panel import Panel
+ from rich.table import Table
+ from rich.text import Text
+ 
++from media_culler.evaluation import EvalResult
+ from media_culler.models import Recommendation
+ from media_culler.organizer import DUPLICATES_BUCKET, Operation
+ from media_culler.reporting import Report
+@@ -203,3 +204,66 @@ def organize_plan_table(ops: list[Operation], limit: int = 15) -> Table:
+             human_size(sum(o.size_bytes for o in items)),
+         )
+     return table
++
++
++def _pct(value: float | None) -> str:
++    return "n/a" if value is None else f"{value * 100:.0f}%"
++
++
++def print_evaluation(console: Console, result: EvalResult) -> None:
++    """Plain, scannable summary of how the tool's decisions compare with the user's labels."""
++    console.print(
++        f"[bold]Evaluation[/] · {result.matched}/{result.labelled} labelled photos in the report"
++    )
++    if result.unmatched:
++        shown = ", ".join(result.unmatched[:5])
++        more = f" (+{len(result.unmatched) - 5} more)" if len(result.unmatched) > 5 else ""
++        console.print(f"[warn]Not in the report: {shown}{more}[/]")
++
++    table = Table(box=box.SIMPLE_HEAVY, title_justify="left", show_header=False)
++    table.add_column("Metric")
++    table.add_column("Value", justify="right")
++    table.add_column("Meaning", style="muted")
++
++    v = result.verdict
++    if v.labelled:
++        table.add_section()
++        table.add_row("[bold]Keep / reject[/]", f"{v.labelled} photos", "")
++        table.add_row(
++            "False-reject rate",
++            _pct(v.false_reject_rate),
++            "photos you'd keep that it rejected (lower is better)",
++        )
++        table.add_row("Keep recall", _pct(v.keep_recall), "of your keepers, how many it also keeps")
++        table.add_row(
++            "Keep precision", _pct(v.keep_precision), "of what it keeps, how many you'd keep"
++        )
++        table.add_row("Reject recall", _pct(v.reject_recall), "of your rejects, how many it flags")
++        table.add_row("Left to review", _pct(v.review_rate), "decisions it hands back to you")
++    s = result.scene
++    if s.labelled:
++        table.add_section()
++        table.add_row("[bold]Scene type[/]", f"{s.labelled} photos", "")
++        table.add_row("Accuracy", _pct(s.accuracy), "people / landscape / general")
++    c = result.closed_eyes
++    if c.labelled:
++        table.add_section()
++        table.add_row("[bold]Closed eyes[/]", f"{c.labelled} photos", "")
++        table.add_row("Precision", _pct(c.precision), f"{c.fp} false alarm(s)")
++        table.add_row("Recall", _pct(c.recall), f"{c.fn} missed")
++    b = result.best_shot
++    if b.groups:
++        table.add_section()
++        table.add_row("[bold]Best of group[/]", f"{b.groups} groups", "")
++        table.add_row("Your pick survives", _pct(b.best_kept_rate), "not set aside as an alternate")
++        table.add_row(
++            "Only your pick kept", _pct(b.picked_exactly_rate), "and the rest were set aside"
++        )
++    if table.row_count == 0:
++        console.print(
++            "[warn]The labels file has no usable verdict, scene, closed_eyes or group columns.[/]"
++        )
++        return
++    console.print(table)
++    if b.misses:
++        console.print(f"[muted]Groups where your best was dropped: {', '.join(b.misses[:10])}[/]")
+diff --git a/tests/test_evaluation.py b/tests/test_evaluation.py
+new file mode 100644
+index 0000000..c2032e5
+--- /dev/null
++++ b/tests/test_evaluation.py
+@@ -0,0 +1,180 @@
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++from typer.testing import CliRunner
++
++from media_culler.cli import app
++from media_culler.evaluation import LabelError, evaluate, load_labels, write_template
++from media_culler.models import (
++    GroupAssessment,
++    GroupRole,
++    ImageRecord,
++    Recommendation,
++    SceneType,
++    Scores,
++)
++from media_culler.reporting import Report, build_summary, write_reports
++
++
++def rec(name: str, recommendation: Recommendation, **kw: object) -> ImageRecord:
++    scene = kw.pop("scene", SceneType.GENERAL)
++    closed = kw.pop("closed", [])
++    scores = Scores(final=70, scene_type=scene, group=GroupAssessment(closed_eyes=closed))
++    return ImageRecord(
++        path=f"/p/{name}",
++        relative_path=name,
++        filename=Path(name).name,
++        extension=".jpg",
++        recommendation=recommendation,
++        scores=scores,
++        **kw,  # type: ignore[arg-type]
++    )
++
++
++def report(images: list[ImageRecord]) -> Report:
++    return Report(
++        generated_at="t",
++        duration_seconds=0,
++        input_directory="/p",
++        skipped_analyzers={},
++        summary=build_summary(images, 0),
++        images=images,
++    )
++
++
++def labels_file(tmp_path: Path, text: str) -> Path:
++    path = tmp_path / "labels.csv"
++    path.write_text(text, encoding="utf-8")
++    return path
++
++
++def test_verdict_metrics(tmp_path):
++    images = [
++        rec("k1.jpg", Recommendation.SELECT),
++        rec("k2.jpg", Recommendation.USABLE),
++        rec("k3.jpg", Recommendation.REJECT),  # false reject
++        rec("k4.jpg", Recommendation.REVIEW),
++        rec("r1.jpg", Recommendation.REJECT),
++        rec("r2.jpg", Recommendation.SELECT),  # false keep
++    ]
++    text = "path,verdict\n" + "\n".join(
++        f"{n},{'keep' if n[0] == 'k' else 'reject'}" for n in (i.relative_path for i in images)
++    )
++    result = evaluate(report(images), load_labels(labels_file(tmp_path, text)))
++    v = result.verdict
++    assert v.labelled == 6
++    assert v.matrix == {
++        "keep": {"keep": 2, "reject": 1, "review": 1},
++        "reject": {"reject": 1, "keep": 1},
++    }
++    assert v.false_reject_rate == 0.25 and v.keep_recall == 0.5
++    assert v.keep_precision == round(2 / 3, 4) and v.reject_recall == 0.5
++    assert v.review_rate == round(1 / 6, 4)
++
++
++def test_scene_and_closed_eye_metrics(tmp_path):
++    images = [
++        rec("a.jpg", Recommendation.SELECT, scene=SceneType.LANDSCAPE),
++        rec("b.jpg", Recommendation.SELECT, scene=SceneType.GENERAL),
++        rec("c.jpg", Recommendation.SELECT, closed=[0]),
++        rec("d.jpg", Recommendation.SELECT, closed=[1]),
++        rec("e.jpg", Recommendation.SELECT),
++    ]
++    text = (
++        "path,scene,closed_eyes\n"
++        "a.jpg,landscape,\nb.jpg,landscape,\nc.jpg,,yes\nd.jpg,,no\ne.jpg,,yes\n"
++    )
++    result = evaluate(report(images), load_labels(labels_file(tmp_path, text)))
++    assert result.scene.accuracy == 0.5
++    assert result.scene.confusion == {"landscape": {"landscape": 1, "general": 1}}
++    c = result.closed_eyes
++    assert (c.tp, c.fp, c.fn, c.tn) == (1, 1, 1, 0)
++    assert c.precision == 0.5 and c.recall == 0.5
++
++
++def test_best_shot_metrics(tmp_path):
++    images = [
++        rec("g1a.jpg", Recommendation.SELECT, group_role=GroupRole.REPRESENTATIVE),
++        rec("g1b.jpg", Recommendation.SELECT, group_role=GroupRole.SIMILAR),
++        rec("g2a.jpg", Recommendation.SELECT, group_role=GroupRole.SIMILAR),  # your pick dropped
++        rec("g2b.jpg", Recommendation.SELECT, group_role=GroupRole.REPRESENTATIVE),
++        rec("g3a.jpg", Recommendation.SELECT, group_role=GroupRole.REPRESENTATIVE),
++        rec("g3b.jpg", Recommendation.SELECT, group_role=GroupRole.REPRESENTATIVE),  # not culled
++    ]
++    text = (
++        "path,group,best\n"
++        "g1a.jpg,1,1\ng1b.jpg,1,\n"
++        "g2a.jpg,2,1\ng2b.jpg,2,\n"
++        "g3a.jpg,3,1\ng3b.jpg,3,\n"
++    )
++    b = evaluate(report(images), load_labels(labels_file(tmp_path, text))).best_shot
++    assert (b.groups, b.best_kept, b.picked_exactly) == (3, 2, 1)
++    assert b.misses == ["2"] and b.best_kept_rate == round(2 / 3, 4)
++
++
++def test_groups_without_exactly_one_pick_are_ignored(tmp_path):
++    images = [rec(f"{n}.jpg", Recommendation.SELECT) for n in "ab"]
++    text = "path,group,best\na.jpg,1,1\nb.jpg,1,1\n"
++    assert evaluate(report(images), load_labels(labels_file(tmp_path, text))).best_shot.groups == 0
++
++
++def test_matching_by_filename_and_unmatched_reporting(tmp_path):
++    images = [
++        rec("trip/a.jpg", Recommendation.SELECT),
++        rec("x/dup.jpg", Recommendation.SELECT),
++        rec("y/dup.jpg", Recommendation.SELECT),
++    ]
++    text = "path,verdict\na.jpg,keep\ndup.jpg,keep\nmissing.jpg,keep\n"
++    result = evaluate(report(images), load_labels(labels_file(tmp_path, text)))
++    assert result.matched == 1 and result.unmatched == ["dup.jpg", "missing.jpg"]  # ambiguous name
++
++
++@pytest.mark.parametrize(
++    ("text", "message"),
++    [
++        ("name,verdict\na,keep\n", "'path' column"),
++        ("path,verdict\na.jpg,maybe\n", "keep or reject"),
++        ("path,scene\na.jpg,beach\n", "scene must be"),
++        ("path,closed_eyes\na.jpg,perhaps\n", "1/0 or yes/no"),
++        ("path,verdict\na.jpg,keep\na.jpg,reject\n", "listed twice"),
++    ],
++)
++def test_bad_labels_are_rejected_with_the_row_in_the_message(tmp_path, text, message):
++    with pytest.raises(LabelError, match=message):
++        load_labels(labels_file(tmp_path, text))
++    with pytest.raises(LabelError, match="not found"):
++        load_labels(tmp_path / "nope.csv")
++
++
++def test_template_lists_valid_images_only(tmp_path):
++    bad = rec("bad.jpg", Recommendation.UNSCORED)
++    bad.status = "error"
++    rep = report([rec("b.jpg", Recommendation.SELECT), rec("a.jpg", Recommendation.SELECT), bad])
++    out = tmp_path / "labels.csv"
++    assert write_template(rep, out) == 2
++    assert out.read_text().splitlines()[:3] == [
++        "path,verdict,scene,closed_eyes,group,best",
++        "a.jpg,,,,,",
++        "b.jpg,,,,,",
++    ]
++    assert load_labels(out)[0].verdict is None  # blank template loads
++
++
++def test_cli_eval_roundtrip(tmp_path):
++    rep = report([rec("a.jpg", Recommendation.SELECT), rec("b.jpg", Recommendation.REJECT)])
++    report_path = write_reports(rep, tmp_path / "r", {"json"})["json"]
++    labels = tmp_path / "labels.csv"
++    runner = CliRunner()
++    init = runner.invoke(app, ["eval", str(report_path), str(labels), "--init"])
++    assert init.exit_code == 0 and labels.exists()
++    assert runner.invoke(app, ["eval", str(report_path), str(labels), "--init"]).exit_code != 0
++    labels.write_text("path,verdict\na.jpg,keep\nb.jpg,keep\n")
++    out = tmp_path / "m.json"
++    done = runner.invoke(app, ["eval", str(report_path), str(labels), "--json", str(out)])
++    assert done.exit_code == 0 and "False-reject rate" in done.output and "50%" in done.output
++    assert json.loads(out.read_text())["verdict"]["false_reject_rate"] == 0.5
++    bad = runner.invoke(app, ["eval", str(report_path), str(tmp_path / "nope.csv")])
++    assert bad.exit_code == 1
+-- 
+2.43.0
+
+
+From 4718b9b55e27e7e3641b42437691f944e68f29e1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 08:12:40 +0000
+Subject: [PATCH 4/5] feat: skip re-hashing unchanged files; CI on macOS/3.13
+ plus a real-decoders job
+
+Re-scanning an unchanged library re-read every byte just to recompute SHA-256.
+The cache now remembers path+size+mtime -> sha256 (rsync-style quick check), so
+a second scan of a 100 GB library does no file reads beyond headers.
+
+CI: add macOS and Python 3.13, and a job that installs the real optional
+decoders (rawpy, pillow-heif) so API breakage there is caught.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ .github/workflows/ci.yml       | 16 ++++++++--
+ src/media_culler/cache.py      | 28 ++++++++++++++++++
+ src/media_culler/pipeline.py   | 42 +++++++++++++--------------
+ src/media_culler/scanner.py    | 42 +++++++++++++++++++++++----
+ tests/test_incremental_scan.py | 53 ++++++++++++++++++++++++++++++++++
+ 5 files changed, 152 insertions(+), 29 deletions(-)
+ create mode 100644 tests/test_incremental_scan.py
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index cf255ba..5bca4ba 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -9,8 +9,8 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        os: [ubuntu-latest, windows-latest]
+-        python: ["3.10", "3.12"]
++        os: [ubuntu-latest, windows-latest, macos-latest]
++        python: ["3.10", "3.13"]
+     steps:
+       - uses: actions/checkout@v4
+       - uses: actions/setup-python@v5
+@@ -21,3 +21,15 @@ jobs:
+       - run: ruff format --check src tests
+       - run: mypy src
+       - run: pytest --cov=media_culler --cov-fail-under=85
++
++  # The core job above runs without optional extras (RAW/HEIC are faked there). This one installs
++  # the real decoders so a broken import or API change in rawpy / pillow-heif is caught.
++  formats:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with: { python-version: "3.12", cache: pip }
++      - run: pip install -e ".[dev,formats]"
++      - run: python -c "import rawpy, pillow_heif; print(rawpy.__version__)"
++      - run: pytest -q
+diff --git a/src/media_culler/cache.py b/src/media_culler/cache.py
+index 29f2d72..3fb50da 100644
+--- a/src/media_culler/cache.py
++++ b/src/media_culler/cache.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ 
+ import logging
+ import sqlite3
++from collections.abc import Iterable
+ from pathlib import Path
+ from types import TracebackType
+ 
+@@ -58,6 +59,12 @@ class AnalysisCache:
+             "sha256 TEXT NOT NULL, analyzer TEXT NOT NULL, fingerprint TEXT NOT NULL, "
+             "payload TEXT NOT NULL, PRIMARY KEY (sha256, analyzer, fingerprint))"
+         )
++        # Remembered content hashes, so re-scanning an unchanged library does not re-read it.
++        db.execute(
++            "CREATE TABLE IF NOT EXISTS file_hashes ("
++            "path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, "
++            "sha256 TEXT NOT NULL)"
++        )
+         db.commit()
+         return db
+ 
+@@ -111,3 +118,24 @@ class AnalysisCache:
+                 self._pending = 0
+         except sqlite3.Error as error:
+             log.warning("Cache write failed: %s", error)
++
++    # -- remembered file hashes (path + size + mtime -> sha256, like rsync's quick check)
++    def known_hashes(self) -> dict[str, tuple[int, int, str]]:
++        """path -> (size, mtime_ns, sha256) for every file seen before."""
++        if self._db is None:
++            return {}
++        try:
++            rows = self._db.execute("SELECT path, size, mtime_ns, sha256 FROM file_hashes")
++            return {path: (size, mtime, digest) for path, size, mtime, digest in rows}
++        except sqlite3.Error as error:
++            log.warning("Cache read failed: %s", error)
++            return {}
++
++    def remember_hashes(self, rows: Iterable[tuple[str, int, int, str]]) -> None:
++        if self._db is None:
++            return
++        try:
++            self._db.executemany("INSERT OR REPLACE INTO file_hashes VALUES (?,?,?,?)", list(rows))
++            self._db.commit()
++        except sqlite3.Error as error:
++            log.warning("Cache write failed: %s", error)
+diff --git a/src/media_culler/pipeline.py b/src/media_culler/pipeline.py
+index ad74b5d..4dad2c7 100644
+--- a/src/media_culler/pipeline.py
++++ b/src/media_culler/pipeline.py
+@@ -83,31 +83,31 @@ class Pipeline:
+         configure_pillow(self.settings.scan.max_pixels)
+         configure_raw(self.settings.scan.raw_half_size)
+ 
+-        records = scan_directory(root, self.settings, self.reporter)
+-        result = RunResult(
+-            records=records,
+-            settings=self.settings,
+-            input_directory=root.resolve(),
+-            started_at=started_at,
+-            duration_seconds=0.0,
+-        )
+-
+-        valid = [r for r in records if r.status == "valid"]
+-        if valid:
+-            analyzers = (
+-                self._analyzers if self._analyzers is not None else build_analyzers(self.settings)
++        cache_path = self.settings.cache_db_path if self.settings.performance.use_cache else None
++        with AnalysisCache(cache_path) as cache:
++            records = scan_directory(root, self.settings, self.reporter, cache)
++            result = RunResult(
++                records=records,
++                settings=self.settings,
++                input_directory=root.resolve(),
++                started_at=started_at,
++                duration_seconds=0.0,
+             )
+-            active = self._setup(analyzers, result)
+-            try:
+-                cache_path = (
+-                    self.settings.cache_db_path if self.settings.performance.use_cache else None
++
++            valid = [r for r in records if r.status == "valid"]
++            if valid:
++                analyzers = (
++                    self._analyzers
++                    if self._analyzers is not None
++                    else build_analyzers(self.settings)
+                 )
+-                with AnalysisCache(cache_path) as cache:
++                active = self._setup(analyzers, result)
++                try:
+                     self._analyze(valid, active, cache)
+                     result.cache_hits, result.cache_misses = cache.hits, cache.misses
+-            finally:
+-                for analyzer in active:
+-                    analyzer.close()
++                finally:
++                    for analyzer in active:
++                        analyzer.close()
+ 
+         self._curate(result)
+         result.duration_seconds = round(time.monotonic() - started, 2)
+diff --git a/src/media_culler/scanner.py b/src/media_culler/scanner.py
+index c1c0389..50f5c7e 100644
+--- a/src/media_culler/scanner.py
++++ b/src/media_culler/scanner.py
+@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
+ from datetime import datetime, timezone
+ from pathlib import Path
+ 
++from media_culler.cache import AnalysisCache
+ from media_culler.config import Settings
+ from media_culler.exceptions import ImageLoadError
+ from media_culler.imaging import read_header, sha256_file
+@@ -60,8 +61,17 @@ def discover_files(root: Path, settings: Settings) -> list[Path]:
+     return found
+ 
+ 
+-def build_record(path: Path, root: Path, max_pixels: int) -> ImageRecord:
+-    """Never raises: failures become ``status='error'`` records."""
++def build_record(
++    path: Path,
++    root: Path,
++    max_pixels: int,
++    known: dict[str, tuple[int, int, str]] | None = None,
++) -> ImageRecord:
++    """Never raises: failures become ``status='error'`` records.
++
++    ``known`` maps resolved path -> (size, mtime_ns, sha256) from an earlier run: a file whose
++    size and modification time are unchanged is not read again.
++    """
+     record = ImageRecord(
+         path=str(path.resolve()),
+         relative_path=path.relative_to(root.resolve()).as_posix(),
+@@ -77,7 +87,11 @@ def build_record(path: Path, root: Path, max_pixels: int) -> ImageRecord:
+         record.width, record.height, record.format = header.width, header.height, header.format
+         record.modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+         record.captured_at = header.captured_at
+-        record.sha256 = sha256_file(path)
++        remembered = (known or {}).get(record.path)
++        if remembered and remembered[:2] == (stat.st_size, stat.st_mtime_ns):
++            record.sha256 = remembered[2]
++        else:
++            record.sha256 = sha256_file(path)
+     except (ImageLoadError, OSError) as error:
+         record.status = "error"
+         record.error = str(error)
+@@ -86,17 +100,21 @@ def build_record(path: Path, root: Path, max_pixels: int) -> ImageRecord:
+ 
+ 
+ def scan_directory(
+-    root: Path, settings: Settings, reporter: ProgressReporter | None = None
++    root: Path,
++    settings: Settings,
++    reporter: ProgressReporter | None = None,
++    cache: AnalysisCache | None = None,
+ ) -> list[ImageRecord]:
+     reporter = reporter or NullReporter()
+     reporter.stage("Scanning", None)
+     files = discover_files(root, settings)
+     reporter.stage("Reading metadata", len(files))
+ 
++    known = cache.known_hashes() if cache is not None else {}
+     records: list[ImageRecord | None] = [None] * len(files)
+     with ThreadPoolExecutor(max_workers=settings.performance.workers) as pool:
+         futures = {
+-            pool.submit(build_record, path, root, settings.scan.max_pixels): index
++            pool.submit(build_record, path, root, settings.scan.max_pixels, known): index
+             for index, path in enumerate(files)
+         }
+         for future in as_completed(futures):
+@@ -104,4 +122,16 @@ def scan_directory(
+             records[index] = future.result()
+             reporter.advance(files[index].name)
+ 
+-    return [r for r in records if r is not None]
++    scanned = [r for r in records if r is not None]
++    if cache is not None:
++        fresh = []
++        for record in scanned:
++            if record.status != "valid" or not record.sha256:
++                continue
++            try:
++                stat = Path(record.path).stat()
++            except OSError:
++                continue
++            fresh.append((record.path, stat.st_size, stat.st_mtime_ns, record.sha256))
++        cache.remember_hashes(fresh)
++    return scanned
+diff --git a/tests/test_incremental_scan.py b/tests/test_incremental_scan.py
+new file mode 100644
+index 0000000..63722b2
+--- /dev/null
++++ b/tests/test_incremental_scan.py
+@@ -0,0 +1,53 @@
++from __future__ import annotations
++
++import os
++
++from tests.conftest import save, textured
++
++from media_culler import scanner
++from media_culler.cache import AnalysisCache
++from media_culler.scanner import scan_directory
++
++
++def test_unchanged_files_are_not_hashed_again(settings, tmp_path, monkeypatch):
++    root = tmp_path / "in"
++    for seed in range(3):
++        save(textured(seed), root / f"{seed}.png")
++    calls: list[str] = []
++    real = scanner.sha256_file
++    monkeypatch.setattr(scanner, "sha256_file", lambda p: calls.append(p.name) or real(p))
++
++    db = tmp_path / "cache.db"
++    with AnalysisCache(db) as cache:
++        first = scan_directory(root, settings, cache=cache)
++    assert sorted(calls) == ["0.png", "1.png", "2.png"]
++
++    calls.clear()
++    with AnalysisCache(db) as cache:
++        second = scan_directory(root, settings, cache=cache)
++    assert calls == [] and [r.sha256 for r in second] == [r.sha256 for r in first]
++
++
++def test_a_changed_file_is_rehashed(settings, tmp_path, monkeypatch):
++    root = tmp_path / "in"
++    path = save(textured(1), root / "a.png")
++    save(textured(2), root / "b.png")
++    db = tmp_path / "cache.db"
++    with AnalysisCache(db) as cache:
++        before = {r.filename: r.sha256 for r in scan_directory(root, settings, cache=cache)}
++
++    save(textured(9), path)  # different pixels, so size and mtime differ
++    stat = path.stat()
++    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
++    with AnalysisCache(db) as cache:
++        after = {r.filename: r.sha256 for r in scan_directory(root, settings, cache=cache)}
++    assert after["a.png"] != before["a.png"] and after["b.png"] == before["b.png"]
++
++
++def test_scanning_without_a_cache_still_works(settings, tmp_path):
++    root = tmp_path / "in"
++    save(textured(1), root / "a.png")
++    assert scan_directory(root, settings)[0].sha256
++    disabled = AnalysisCache(None)
++    assert disabled.known_hashes() == {}
++    disabled.remember_hashes([("x", 1, 1, "h")])  # no-op, no error
+-- 
+2.43.0
+
+
+From a2da0888340cd6708fa24f78f9fbce99a8db2805 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 08:13:18 +0000
+Subject: [PATCH 5/5] docs: RAW, safe organize/undo, eval and incremental
+ scanning
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ README.md | 45 ++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/README.md b/README.md
+index 8f04d8b..29225a7 100644
+--- a/README.md
++++ b/README.md
+@@ -36,7 +36,9 @@ pair (installing both is a known source of import conflicts, and no GUI is used)
+ | `culler run [DIR]` | Analyse, score, write `reports/inventory.json` + `.csv` |
+ | `culler scan [DIR]` | Inventory only: formats, sizes, unreadable files |
+ | `culler report` | Re-display the last report |
+-| `culler organize REPORT --dest OUT` | Dry-run plan; add `--apply` to copy (or `--mode move/symlink`) |
++| `culler organize REPORT --dest OUT` | Dry-run plan; add `--apply` to copy (or `--mode move/symlink`), `--group-folders` for a folder per burst |
++| `culler undo --dest OUT` | Reverse the last organize run (dry run; add `--apply`) |
++| `culler eval REPORT LABELS.csv` | Score the tool's decisions against your own labels (`--init` writes a template) |
+ | `culler models download\|status` | Manage the face model |
+ | `culler config init\|show\|validate` | Starter config / effective config / validation |
+ | `culler doctor` | Environment check |
+@@ -115,6 +117,33 @@ and tune them in `culler.yaml` (`scene`, `selection`, `bursts`, `thresholds`).
+ 
+ Report schema is now **3** (additive). Schema-2 reports still load.
+ 
++## RAW, organizing safely, and measuring
++
++**RAW.** Camera RAW (`.cr2 .cr3 .nef .arw .dng .orf .raf .rw2 .pef .srw .nrw`) is decoded with `rawpy`
++(extra `formats`) at full resolution, with the camera's orientation applied. `scan.raw_half_size: true`
++is ~4x faster but reads sharpness at half resolution, so RAW and JPEG scores are less comparable.
++Without `rawpy`, a RAW file fails with a message saying what to install instead of being scored on a
++tiny embedded preview. With RAW+JPEG shooting, a JPEG beside a same-named RAW (same folder, capture
++times within 2 s) is that RAW's *companion*: it joins no group and inherits the RAW's decision, so the
++pair is never "culled" as a two-frame burst (`scan.pair_raw_jpeg`).
++
++**Organizing.** `culler organize` is a dry run until `--apply`. Copies are written to a temp file and
++checked against the SHA-256 recorded at analysis before being renamed into place; a cross-device move
++deletes its source only after that check. Nothing is overwritten. `.xmp`/`.aae`/`.pp3`/`.dop`/`.on1`/
++`.thm` sidecars and Live Photo `.mov` files travel with their photo (`--no-sidecars` to skip).
++Every run is journalled to `<dest>/.culler/undo/<time>.jsonl`; `culler undo --dest <dest> --apply`
++reverses the latest one. Undo removes a copy only if it still matches what was made and the original
++still exists, restores a moved file only if its old location is free, and skips (and tells you) anything
++else. Report schema is **4** (adds `paired_with`); older reports still load.
++
++**Measuring.** `culler eval REPORT labels.csv --init` writes a template with one row per photo. Fill in
++only what you care about: `verdict` (keep/reject), `scene`, `closed_eyes`, and `group` + `best` for the
++frame you would keep from a burst. `culler eval REPORT labels.csv` then prints false-reject rate (your
++keepers it rejected, the costly error), keep/reject precision and recall, scene accuracy, closed-eye
++precision and recall, and how often your best frame survives. Change a threshold, re-run `culler run`
++(analysis is cached), and re-run `eval` to see whether it helped. Re-scanning an unchanged library does
++not re-hash it: file hashes are remembered by path, size and modification time.
++
+ ## Behaviour changes from v0.1 (deliberate)
+ 
+ | Issue in v0.1 | Now |
+@@ -142,16 +171,18 @@ Report schema is now **3** (additive). Schema-2 reports still load.
+ * Horizon detection finds one dominant, near-level line. Mountains, shorelines at an angle, or
+   reflections can fool it; weak detections (`scene.horizon_min_confidence`) are ignored.
+ * Burst grouping needs EXIF capture time. Without it, frames group by appearance alone. A RAW+JPEG
+-  pair shot together is grouped like a burst. Bursts are keyed to capture time as written, with no
++  pair is one shot (see above), but a JPEG exported *later* under another name is not recognised as
++  a companion and will group with its RAW as a duplicate. Bursts are keyed to capture time as written, with no
+   time zone, so two cameras with different clock settings will not link.
+ * MediaPipe landmarks carry no visibility, so that sub-score is a constant 1.0.
+-* Duplicate grouping is O(n²) (vectorised; fine for ~10⁴ images, use an LSH/BK-tree beyond that).
+ * Hashes detect *similar framing*, so a heavily blurred twin of a photo groups with it; that is
+   intentional (the sharper one is picked as representative).
+-* HEIC/HEIF is decoded through `pillow-heif` (extra `formats`). **Camera RAW is not decoded**: the RAW
+-  extensions are scanned, but `rawpy` is not wired into `imaging.load_rgb`. TIFF-based RAW (DNG, NEF,
+-  ARW, CR2...) may open through Pillow as a small embedded preview and be scored on that, so keep RAW
+-  out of the input folder until that is implemented.
++* HEIC/HEIF is decoded through `pillow-heif` and camera RAW through `rawpy` (both in extra `formats`).
++  The RAW path is tested against a fake `rawpy` plus a CI job that installs the real one, but not yet
++  against a corpus of real RAW files from every camera maker; try a few of yours first. CR3 and recent
++  bodies depend on your installed LibRaw version.
++* Duplicate grouping is vectorised but still compares every leader with every image: ~1.4 s for 20,000
++  random hashes, growing quadratically. Real libraries cluster, so it is usually faster.
+ 
+ ## Development
+ 
+-- 
+2.43.0
+
