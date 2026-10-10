@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 from types import TracebackType
 
@@ -57,6 +58,12 @@ class AnalysisCache:
             "CREATE TABLE IF NOT EXISTS results ("
             "sha256 TEXT NOT NULL, analyzer TEXT NOT NULL, fingerprint TEXT NOT NULL, "
             "payload TEXT NOT NULL, PRIMARY KEY (sha256, analyzer, fingerprint))"
+        )
+        # Remembered content hashes, so re-scanning an unchanged library does not re-read it.
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS file_hashes ("
+            "path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, "
+            "sha256 TEXT NOT NULL)"
         )
         db.commit()
         return db
@@ -109,5 +116,26 @@ class AnalysisCache:
             if self._pending >= _COMMIT_EVERY:
                 self._db.commit()
                 self._pending = 0
+        except sqlite3.Error as error:
+            log.warning("Cache write failed: %s", error)
+
+    # -- remembered file hashes (path + size + mtime -> sha256, like rsync's quick check)
+    def known_hashes(self) -> dict[str, tuple[int, int, str]]:
+        """path -> (size, mtime_ns, sha256) for every file seen before."""
+        if self._db is None:
+            return {}
+        try:
+            rows = self._db.execute("SELECT path, size, mtime_ns, sha256 FROM file_hashes")
+            return {path: (size, mtime, digest) for path, size, mtime, digest in rows}
+        except sqlite3.Error as error:
+            log.warning("Cache read failed: %s", error)
+            return {}
+
+    def remember_hashes(self, rows: Iterable[tuple[str, int, int, str]]) -> None:
+        if self._db is None:
+            return
+        try:
+            self._db.executemany("INSERT OR REPLACE INTO file_hashes VALUES (?,?,?,?)", list(rows))
+            self._db.commit()
         except sqlite3.Error as error:
             log.warning("Cache write failed: %s", error)

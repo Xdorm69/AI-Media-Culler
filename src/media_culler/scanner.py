@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+from media_culler.cache import AnalysisCache
 from media_culler.config import Settings
 from media_culler.exceptions import ImageLoadError
 from media_culler.imaging import read_header, sha256_file
@@ -60,8 +61,17 @@ def discover_files(root: Path, settings: Settings) -> list[Path]:
     return found
 
 
-def build_record(path: Path, root: Path, max_pixels: int) -> ImageRecord:
-    """Never raises: failures become ``status='error'`` records."""
+def build_record(
+    path: Path,
+    root: Path,
+    max_pixels: int,
+    known: dict[str, tuple[int, int, str]] | None = None,
+) -> ImageRecord:
+    """Never raises: failures become ``status='error'`` records.
+
+    ``known`` maps resolved path -> (size, mtime_ns, sha256) from an earlier run: a file whose
+    size and modification time are unchanged is not read again.
+    """
     record = ImageRecord(
         path=str(path.resolve()),
         relative_path=path.relative_to(root.resolve()).as_posix(),
@@ -77,7 +87,11 @@ def build_record(path: Path, root: Path, max_pixels: int) -> ImageRecord:
         record.width, record.height, record.format = header.width, header.height, header.format
         record.modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
         record.captured_at = header.captured_at
-        record.sha256 = sha256_file(path)
+        remembered = (known or {}).get(record.path)
+        if remembered and remembered[:2] == (stat.st_size, stat.st_mtime_ns):
+            record.sha256 = remembered[2]
+        else:
+            record.sha256 = sha256_file(path)
     except (ImageLoadError, OSError) as error:
         record.status = "error"
         record.error = str(error)
@@ -86,17 +100,21 @@ def build_record(path: Path, root: Path, max_pixels: int) -> ImageRecord:
 
 
 def scan_directory(
-    root: Path, settings: Settings, reporter: ProgressReporter | None = None
+    root: Path,
+    settings: Settings,
+    reporter: ProgressReporter | None = None,
+    cache: AnalysisCache | None = None,
 ) -> list[ImageRecord]:
     reporter = reporter or NullReporter()
     reporter.stage("Scanning", None)
     files = discover_files(root, settings)
     reporter.stage("Reading metadata", len(files))
 
+    known = cache.known_hashes() if cache is not None else {}
     records: list[ImageRecord | None] = [None] * len(files)
     with ThreadPoolExecutor(max_workers=settings.performance.workers) as pool:
         futures = {
-            pool.submit(build_record, path, root, settings.scan.max_pixels): index
+            pool.submit(build_record, path, root, settings.scan.max_pixels, known): index
             for index, path in enumerate(files)
         }
         for future in as_completed(futures):
@@ -104,4 +122,16 @@ def scan_directory(
             records[index] = future.result()
             reporter.advance(files[index].name)
 
-    return [r for r in records if r is not None]
+    scanned = [r for r in records if r is not None]
+    if cache is not None:
+        fresh = []
+        for record in scanned:
+            if record.status != "valid" or not record.sha256:
+                continue
+            try:
+                stat = Path(record.path).stat()
+            except OSError:
+                continue
+            fresh.append((record.path, stat.st_size, stat.st_mtime_ns, record.sha256))
+        cache.remember_hashes(fresh)
+    return scanned

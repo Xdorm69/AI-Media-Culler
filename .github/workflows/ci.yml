@@ -9,8 +9,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ["3.10", "3.12"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,3 +21,15 @@ jobs:
       - run: ruff format --check src tests
       - run: mypy src
       - run: pytest --cov=media_culler --cov-fail-under=85
+
+  # The core job above runs without optional extras (RAW/HEIC are faked there). This one installs
+  # the real decoders so a broken import or API change in rawpy / pillow-heif is caught.
+  formats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e ".[dev,formats]"
+      - run: python -c "import rawpy, pillow_heif; print(rawpy.__version__)"
+      - run: pytest -q

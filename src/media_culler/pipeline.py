@@ -83,31 +83,31 @@ class Pipeline:
         configure_pillow(self.settings.scan.max_pixels)
         configure_raw(self.settings.scan.raw_half_size)
 
-        records = scan_directory(root, self.settings, self.reporter)
-        result = RunResult(
-            records=records,
-            settings=self.settings,
-            input_directory=root.resolve(),
-            started_at=started_at,
-            duration_seconds=0.0,
-        )
-
-        valid = [r for r in records if r.status == "valid"]
-        if valid:
-            analyzers = (
-                self._analyzers if self._analyzers is not None else build_analyzers(self.settings)
+        cache_path = self.settings.cache_db_path if self.settings.performance.use_cache else None
+        with AnalysisCache(cache_path) as cache:
+            records = scan_directory(root, self.settings, self.reporter, cache)
+            result = RunResult(
+                records=records,
+                settings=self.settings,
+                input_directory=root.resolve(),
+                started_at=started_at,
+                duration_seconds=0.0,
             )
-            active = self._setup(analyzers, result)
-            try:
-                cache_path = (
-                    self.settings.cache_db_path if self.settings.performance.use_cache else None
+
+            valid = [r for r in records if r.status == "valid"]
+            if valid:
+                analyzers = (
+                    self._analyzers
+                    if self._analyzers is not None
+                    else build_analyzers(self.settings)
                 )
-                with AnalysisCache(cache_path) as cache:
+                active = self._setup(analyzers, result)
+                try:
                     self._analyze(valid, active, cache)
                     result.cache_hits, result.cache_misses = cache.hits, cache.misses
-            finally:
-                for analyzer in active:
-                    analyzer.close()
+                finally:
+                    for analyzer in active:
+                        analyzer.close()
 
         self._curate(result)
         result.duration_seconds = round(time.monotonic() - started, 2)
