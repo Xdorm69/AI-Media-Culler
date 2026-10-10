@@ -17,6 +17,7 @@ from rich.table import Table
 from media_culler import __version__
 from media_culler.config import DEFAULT_CONFIG_YAML, Settings, load_settings
 from media_culler.doctor import run_checks
+from media_culler.evaluation import evaluate, load_labels, write_template
 from media_culler.exceptions import ConfigError, CullerError
 from media_culler.logging_setup import configure_logging
 from media_culler.model_download import download_file
@@ -29,6 +30,7 @@ from media_culler.ui.progress import RichReporter
 from media_culler.ui.render import (
     human_size,
     organize_plan_table,
+    print_evaluation,
     print_results,
 )
 
@@ -415,6 +417,42 @@ def undo(
                 box=box.ROUNDED,
             )
         )
+
+
+@app.command("eval")
+def eval_command(
+    report_file: Annotated[Path, typer.Argument(help="inventory.json from `culler run`.")],
+    labels_file: Annotated[Path, typer.Argument(help="Your labels CSV (see --init).")],
+    init: Annotated[
+        bool,
+        typer.Option(
+            "--init", help="Write a blank labels CSV listing the report's photos, then exit."
+        ),
+    ] = False,
+    json_out: Annotated[
+        Path | None, typer.Option("--json", help="Also write the metrics as JSON.")
+    ] = None,
+) -> None:
+    """Compare the tool's decisions with your own labels (precision, recall, best-shot hit rate)."""
+    console = make_console()
+    try:
+        loaded = load_report(report_file)
+        if init:
+            if labels_file.exists():
+                console.print(f"[warn]{labels_file} exists; not overwriting it.[/]")
+                raise typer.Exit(EXIT_ERROR)
+            count = write_template(loaded, labels_file)
+            console.print(
+                f"[ok]Wrote {count} rows to {labels_file}[/] · fill in the columns you care about."
+            )
+            return
+        result = evaluate(loaded, load_labels(labels_file))
+    except CullerError as error:
+        raise _fail(error) from error
+    print_evaluation(console, result)
+    if json_out:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------- models

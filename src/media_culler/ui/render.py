@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from media_culler.evaluation import EvalResult
 from media_culler.models import Recommendation
 from media_culler.organizer import DUPLICATES_BUCKET, Operation
 from media_culler.reporting import Report
@@ -203,3 +204,66 @@ def organize_plan_table(ops: list[Operation], limit: int = 15) -> Table:
             human_size(sum(o.size_bytes for o in items)),
         )
     return table
+
+
+def _pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value * 100:.0f}%"
+
+
+def print_evaluation(console: Console, result: EvalResult) -> None:
+    """Plain, scannable summary of how the tool's decisions compare with the user's labels."""
+    console.print(
+        f"[bold]Evaluation[/] · {result.matched}/{result.labelled} labelled photos in the report"
+    )
+    if result.unmatched:
+        shown = ", ".join(result.unmatched[:5])
+        more = f" (+{len(result.unmatched) - 5} more)" if len(result.unmatched) > 5 else ""
+        console.print(f"[warn]Not in the report: {shown}{more}[/]")
+
+    table = Table(box=box.SIMPLE_HEAVY, title_justify="left", show_header=False)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_column("Meaning", style="muted")
+
+    v = result.verdict
+    if v.labelled:
+        table.add_section()
+        table.add_row("[bold]Keep / reject[/]", f"{v.labelled} photos", "")
+        table.add_row(
+            "False-reject rate",
+            _pct(v.false_reject_rate),
+            "photos you'd keep that it rejected (lower is better)",
+        )
+        table.add_row("Keep recall", _pct(v.keep_recall), "of your keepers, how many it also keeps")
+        table.add_row(
+            "Keep precision", _pct(v.keep_precision), "of what it keeps, how many you'd keep"
+        )
+        table.add_row("Reject recall", _pct(v.reject_recall), "of your rejects, how many it flags")
+        table.add_row("Left to review", _pct(v.review_rate), "decisions it hands back to you")
+    s = result.scene
+    if s.labelled:
+        table.add_section()
+        table.add_row("[bold]Scene type[/]", f"{s.labelled} photos", "")
+        table.add_row("Accuracy", _pct(s.accuracy), "people / landscape / general")
+    c = result.closed_eyes
+    if c.labelled:
+        table.add_section()
+        table.add_row("[bold]Closed eyes[/]", f"{c.labelled} photos", "")
+        table.add_row("Precision", _pct(c.precision), f"{c.fp} false alarm(s)")
+        table.add_row("Recall", _pct(c.recall), f"{c.fn} missed")
+    b = result.best_shot
+    if b.groups:
+        table.add_section()
+        table.add_row("[bold]Best of group[/]", f"{b.groups} groups", "")
+        table.add_row("Your pick survives", _pct(b.best_kept_rate), "not set aside as an alternate")
+        table.add_row(
+            "Only your pick kept", _pct(b.picked_exactly_rate), "and the rest were set aside"
+        )
+    if table.row_count == 0:
+        console.print(
+            "[warn]The labels file has no usable verdict, scene, closed_eyes or group columns.[/]"
+        )
+        return
+    console.print(table)
+    if b.misses:
+        console.print(f"[muted]Groups where your best was dropped: {', '.join(b.misses[:10])}[/]")

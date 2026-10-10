@@ -25,6 +25,18 @@
 
 `culler organize reports/inventory.json --dest {{path/to/sorted}} --apply`
 
+- Keep each burst in its own folder, or reverse the last organize run:
+
+`culler organize reports/inventory.json --dest {{path/to/sorted}} --group-folders --apply`
+
+`culler undo --dest {{path/to/sorted}} --apply`
+
+- Measure the tool against your own picks (fill in the generated CSV, then compare):
+
+`culler eval reports/inventory.json {{labels.csv}} --init`
+
+`culler eval reports/inventory.json {{labels.csv}}`
+
 - Re-display the last report without re-analysing:
 
 `culler report`
