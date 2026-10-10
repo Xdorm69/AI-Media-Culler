@@ -77,6 +77,10 @@ def apply_recommendations(records: list[ImageRecord], thresholds: ThresholdsConf
             record.recommendation, record.recommendation_reason = classify(record, thresholds)
 
 
+# A frame this much softer than its group's sharpest is called out by name in the reason.
+_SOFT_RELATIVE = 0.7
+
+
 def _selection_value(record: ImageRecord) -> float:
     """Selection score, falling back to the final score for records that predate it."""
     scores = record.scores
@@ -110,9 +114,26 @@ def select_best_shots(records: list[ImageRecord], config: SelectionConfig | None
         _select_in_group(members, config)
 
 
+def _frame_sharpness(record: ImageRecord) -> float:
+    """Raw sharpness for comparing frames of one scene (tiled measure if we have it)."""
+    values = [record.technical.sharpness] if record.technical else []
+    if record.scene is not None:
+        values.append(record.scene.sharpness_focus)
+    return max(values, default=0.0)
+
+
 def _select_in_group(members: list[ImageRecord], config: SelectionConfig) -> None:
     scored = [r for r in members if _selection_value(r) >= 0]
     pool = scored or members
+
+    sharpest = max((_frame_sharpness(r) for r in pool), default=0.0)
+
+    def relative_sharpness(record: ImageRecord) -> float:
+        return _frame_sharpness(record) / sharpest if sharpest > 0 else 1.0
+
+    def value(record: ImageRecord) -> float:
+        penalty = config.sharpness_weight * (1.0 - relative_sharpness(record))
+        return _selection_value(record) - penalty
 
     # The median (not max) face count, so one false detection can't make every other frame
     # look like it lost a person.
@@ -121,10 +142,10 @@ def _select_in_group(members: list[ImageRecord], config: SelectionConfig) -> Non
     def problems(record: ImageRecord) -> int:
         return _closed_eyes(record) + max(0, typical - _significant_faces(record))
 
-    top = max(_selection_value(r) for r in pool)
-    contenders = [r for r in pool if _selection_value(r) >= top - config.margin]
-    best = min(contenders, key=lambda r: (problems(r), -_selection_value(r), r.path))
-    strongest = min(pool, key=lambda r: (-_selection_value(r), r.path))
+    top = max(value(r) for r in pool)
+    contenders = [r for r in pool if value(r) >= top - config.margin]
+    best = min(contenders, key=lambda r: (problems(r), -value(r), r.path))
+    strongest = min(pool, key=lambda r: (-value(r), r.path))
 
     for record in members:
         record.best_shot_score = best.final_score
@@ -142,13 +163,17 @@ def _select_in_group(members: list[ImageRecord], config: SelectionConfig) -> Non
         else:
             record.group_role = GroupRole.SIMILAR
             record.is_group_representative = False
-            record.selection_reason = _why_not(record, best, problems(record), problems(best))
+            record.selection_reason = _why_not(
+                record, problems(record), problems(best), relative_sharpness(record)
+            )
 
 
-def _why_not(record: ImageRecord, best: ImageRecord, mine: int, theirs: int) -> str:
+def _why_not(record: ImageRecord, mine: int, theirs: int, relative_sharpness: float) -> str:
     closed = _closed_eyes(record)
     if closed and mine > theirs:
         return f"Closed eyes on {closed} face(s); a better frame exists in this group"
     if mine > theirs:
         return "A subject is missing or turned away compared with the best frame"
+    if relative_sharpness < _SOFT_RELATIVE:
+        return f"Softer than the sharpest frame ({relative_sharpness:.0%} as sharp)"
     return "Lower selection score than the group's best shot"

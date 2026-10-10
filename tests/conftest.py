@@ -84,3 +84,20 @@ def landscape_image(
         matrix = cv2.getRotationMatrix2D((width / 2, height / 2), tilt, 1.0)
         image = cv2.warpAffine(image, matrix, (width, height), borderMode=cv2.BORDER_REPLICATE)
     return image
+
+
+def save_timed(array: np.ndarray, path: Path, when: str | None, subsec: str | None = None) -> Path:
+    """Save with EXIF DateTimeOriginal (``when`` like '2026:06:12 07:07:26') and optional subsec."""
+    exif = Image.Exif()
+    if when is not None:
+        ifd = exif.get_ifd(0x8769)
+        ifd[0x9003] = when
+        if subsec is not None:
+            ifd[0x9291] = subsec
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Pass bytes: an Exif holding only a sub-IFD is falsy, so Pillow's PNG writer skips it.
+    options: dict[str, object] = {"exif": exif.tobytes()}
+    if path.suffix == ".jpg":
+        options["quality"] = 95
+    Image.fromarray(array).save(path, **options)  # type: ignore[arg-type]
+    return path

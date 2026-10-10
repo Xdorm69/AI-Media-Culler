@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from media_culler import __version__
 from media_culler.exceptions import ReportError
-from media_culler.models import GroupRole, ImageRecord, Recommendation
+from media_culler.models import GroupKind, GroupRole, ImageRecord, Recommendation
 from media_culler.pipeline import RunResult
 
 SCHEMA_VERSION = 3
@@ -42,6 +42,8 @@ class Summary(BaseModel):
     analyzer_failures: dict[str, int]
     scene_counts: dict[str, int] = Field(default_factory=dict)
     closed_eyes_photos: int = 0
+    burst_groups: int = 0
+    burst_frames: int = 0
     top: list[TopImage]
 
 
@@ -80,6 +82,7 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int 
             key = record.scores.scene_type.value
             scenes[key] = scenes.get(key, 0) + 1
 
+    bursts = [r for r in valid if r.group_kind == GroupKind.BURST]
     values = [r.final_score for r in scored if r.final_score is not None]
     return Summary(
         total_files=len(records),
@@ -94,6 +97,8 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int 
         median_score=round(statistics.median(values), 2) if values else None,
         analyzer_failures=failures,
         scene_counts=dict(sorted(scenes.items())),
+        burst_groups=len({r.duplicate_group for r in bursts}),
+        burst_frames=len(bursts),
         closed_eyes_photos=sum(
             1 for r in valid if r.scores and r.scores.group and r.scores.group.closed_eyes
         ),
@@ -160,6 +165,8 @@ CSV_COLUMNS = [
     "subjects",
     "closed_eyes",
     "duplicate_group",
+    "group_kind",
+    "captured_at",
     "group_role",
     "width",
     "height",
@@ -187,6 +194,8 @@ def _csv_row(r: ImageRecord) -> dict[str, Any]:
         "subjects": len(s.group.significant) if s and s.group else None,
         "closed_eyes": len(s.group.closed_eyes) if s and s.group else None,
         "duplicate_group": r.duplicate_group,
+        "group_kind": r.group_kind.value if r.group_kind else "",
+        "captured_at": r.captured_at or "",
         "group_role": r.group_role.value if r.group_role else "",
         "width": r.width,
         "height": r.height,

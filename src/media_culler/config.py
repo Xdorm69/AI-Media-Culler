@@ -156,6 +156,21 @@ class SceneConfig(_Section):
     heuristic_horizon_confidence: float = Field(0.6, ge=0, le=1)
 
 
+class BurstConfig(_Section):
+    """Group frames shot moments apart even when they differ more than a plain duplicate.
+
+    A burst is a chain of photos where each is within ``max_gap_seconds`` of the previous one
+    and looks continuous with it (perceptual-hash distance <= ``hamming_threshold``). Needs
+    EXIF capture times; photos without them are still grouped by appearance alone.
+    """
+
+    enabled: bool = True
+    max_gap_seconds: float = Field(2.0, gt=0)
+    hamming_threshold: int = Field(14, ge=0, le=32)
+    # A chain is cut once it spans this long, so a slow walk can't chain a whole afternoon.
+    max_span_seconds: float = Field(20.0, gt=0)
+
+
 class SelectionConfig(_Section):
     """Who counts as a subject, when eyes count as closed, and how best shots are chosen."""
 
@@ -174,6 +189,10 @@ class SelectionConfig(_Section):
     # Among similar frames, only those within this many points of the best may win on
     # "nobody blinked", so a sharp frame is never beaten by a blurry one just for open eyes.
     margin: float = Field(12, ge=0, le=100)
+    # Within a group, a frame much softer than the group's sharpest loses up to this many
+    # points. Motion blur is the commonest reason to discard a burst frame, and the absolute
+    # sharpness score saturates when frames are all soft or all crisp.
+    sharpness_weight: float = Field(15, ge=0, le=50)
 
 
 class PerformanceConfig(_Section):
@@ -192,6 +211,7 @@ class Settings(_Section):
     faces: FacesConfig = FacesConfig()
     scene: SceneConfig = SceneConfig()
     selection: SelectionConfig = SelectionConfig()
+    bursts: BurstConfig = BurstConfig()
     performance: PerformanceConfig = PerformanceConfig()
 
     @property
@@ -356,6 +376,13 @@ selection:                          # group photos and best-shot choice
   closed_face_cap: 45               # max score of a face with closed eyes
   closed_subject_cap: 60            # max subject score if any subject has closed eyes
   margin: 12                        # open-eyes can only win within this many points of the best
+  sharpness_weight: 15              # points lost by a frame much softer than its group's sharpest
+
+bursts:                             # group frames shot moments apart (needs EXIF time)
+  enabled: true
+  max_gap_seconds: 2.0              # max time between consecutive frames of one burst
+  hamming_threshold: 14             # how alike consecutive frames must look (looser than dupes)
+  max_span_seconds: 20.0            # cut a chain after this long
 
 performance:
   workers: 4

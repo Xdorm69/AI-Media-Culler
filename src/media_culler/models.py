@@ -22,6 +22,12 @@ class SceneType(str, Enum):
     GENERAL = "general"
 
 
+class GroupKind(str, Enum):
+    DUPLICATE = "duplicate"  # byte-identical files
+    BURST = "burst"  # taken within moments of each other and visually continuous
+    SIMILAR = "similar"  # look alike but not a burst (different times, or no capture time)
+
+
 class GroupRole(str, Enum):
     UNIQUE = "unique"
     REPRESENTATIVE = "representative"
@@ -149,6 +155,7 @@ class ImageRecord(BaseModel):
     height: int = 0
     format: str | None = None
     modified_at: str | None = None
+    captured_at: str | None = None  # EXIF capture time (naive local ISO), if present
     sha256: str | None = None
 
     technical: TechnicalMetrics | None = None
@@ -167,6 +174,8 @@ class ImageRecord(BaseModel):
 
     duplicate_group: int | None = None
     duplicate_group_size: int = 1
+    group_kind: GroupKind | None = None
+    group_span_seconds: float | None = None  # first to last capture time within the group
     group_role: GroupRole | None = None
     is_group_representative: bool | None = None
     best_shot_score: float | None = None

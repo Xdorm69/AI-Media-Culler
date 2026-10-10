@@ -76,6 +76,7 @@ def build_record(path: Path, root: Path, max_pixels: int) -> ImageRecord:
         record.size_bytes = stat.st_size
         record.width, record.height, record.format = header.width, header.height, header.format
         record.modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        record.captured_at = header.captured_at
         record.sha256 = sha256_file(path)
     except (ImageLoadError, OSError) as error:
         record.status = "error"

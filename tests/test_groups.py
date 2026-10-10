@@ -256,6 +256,7 @@ def test_group_shot_picks_the_frame_where_nobody_blinks(settings, tmp_path):
     """The blinking frame is technically sharper, so it still outscores the open-eyes frame
     even after the closed-eyes caps; selection must prefer the open-eyes one inside the margin."""
     settings.selection.margin = 20
+    settings.selection.sharpness_weight = 0  # isolate the blink rule; sharpness is tested elsewhere
     root = tmp_path / "in"
     base = np.random.default_rng(1).integers(0, 255, (480, 640, 3), dtype=np.uint8)
     save(marked(base, 1), root / "a_blink_sharper.png")

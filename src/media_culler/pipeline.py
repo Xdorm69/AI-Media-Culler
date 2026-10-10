@@ -235,10 +235,13 @@ class Pipeline:
 
     def _curate(self, result: RunResult) -> None:
         records = result.records
-        if self.settings.duplicates.enabled:
+        duplicates, bursts = self.settings.duplicates, self.settings.bursts
+        if duplicates.enabled or bursts.enabled:
             self.reporter.stage("Grouping similar images", None)
             result.duplicate_groups = assign_duplicate_groups(
-                records, self.settings.duplicates.hamming_threshold
+                records,
+                duplicates.hamming_threshold if duplicates.enabled else None,
+                bursts,
             )
         self.reporter.stage("Scoring", None)
         for record in records:

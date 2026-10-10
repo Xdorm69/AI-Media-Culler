@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 from functools import cached_property
 from pathlib import Path
 
@@ -27,6 +28,10 @@ except ImportError:  # core install: HEIC/HEIF files simply fail to open (report
     HEIF_AVAILABLE = False
 
 EXIF_ORIENTATION = 0x0112
+_EXIF_IFD = 0x8769
+_TIME_TAGS = (0x9003, 0x9004)  # DateTimeOriginal, DateTimeDigitized
+_SUBSEC_TAGS = {0x9003: 0x9291, 0x9004: 0x9292}
+_TIME_FORMAT = "%Y:%m:%d %H:%M:%S"
 _SWAPPED_ORIENTATIONS = {5, 6, 7, 8}
 _HASH_CHUNK = 1024 * 1024
 
@@ -36,6 +41,7 @@ class ImageHeader:
     width: int  # orientation-corrected
     height: int
     format: str | None
+    captured_at: str | None = None  # ISO 8601, naive local time as written by the camera
 
 
 def configure_pillow(max_pixels: int) -> None:
@@ -51,13 +57,46 @@ def sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def parse_capture_time(exif: Image.Exif) -> str | None:
+    """Capture time from EXIF as a naive ISO string, or None.
+
+    Cameras write local time with no zone, so only *differences* between photos are
+    meaningful. Sub-second digits are kept: bursts routinely fall inside one second.
+    File modification time is deliberately NOT used as a fallback: copying or exporting
+    resets it, and a wrong time is worse than none (grouping then falls back to
+    appearance alone).
+    """
+    try:
+        ifd = exif.get_ifd(_EXIF_IFD)
+    except Exception:  # malformed EXIF
+        return None
+    for tag in _TIME_TAGS:
+        raw = ifd.get(tag)
+        if not isinstance(raw, str):
+            continue
+        try:
+            moment = datetime.strptime(raw.strip().rstrip("\x00"), _TIME_FORMAT)
+        except ValueError:
+            continue  # includes the "0000:00:00 00:00:00" some cameras write
+        subsec = ifd.get(_SUBSEC_TAGS[tag])
+        if isinstance(subsec, str | bytes):
+            digits = subsec.decode(errors="ignore") if isinstance(subsec, bytes) else subsec
+            digits = digits.strip().rstrip("\x00")
+            if digits.isdigit():
+                moment = moment.replace(microsecond=int(float("0." + digits) * 1_000_000))
+        return moment.isoformat()
+    return None
+
+
 def read_header(path: Path, max_pixels: int) -> ImageHeader:
     """Read dimensions/format without decoding pixels. Raises ImageLoadError."""
     try:
         with Image.open(path) as image:
             width, height = image.size
             fmt = image.format
-            orientation = image.getexif().get(EXIF_ORIENTATION)
+            exif = image.getexif()
+            orientation = exif.get(EXIF_ORIENTATION)
+            captured_at = parse_capture_time(exif)
     except Exception as error:  # PIL raises many types for corrupt input
         raise ImageLoadError(f"Cannot open image: {error}") from error
 
@@ -65,7 +104,7 @@ def read_header(path: Path, max_pixels: int) -> ImageHeader:
         raise ImageLoadError(f"Image too large ({width}x{height} > {max_pixels} pixels)")
     if orientation in _SWAPPED_ORIENTATIONS:
         width, height = height, width
-    return ImageHeader(width=width, height=height, format=fmt)
+    return ImageHeader(width=width, height=height, format=fmt, captured_at=captured_at)
 
 
 def load_rgb(path: Path, max_pixels: int) -> np.ndarray:

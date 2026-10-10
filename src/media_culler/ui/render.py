@@ -70,10 +70,15 @@ def tldr_panel(report: Report, report_path: Path | None = None) -> Panel:
 
     lines: list[RenderableType] = [headline]
     if s.duplicate_groups:
+        plural = "s" if s.duplicate_groups != 1 else ""
+        bursts = (
+            f" ({s.burst_groups} burst{'s' if s.burst_groups != 1 else ''})"
+            if s.burst_groups
+            else ""
+        )
         lines.append(
             Text(
-                f"{s.duplicate_groups} group{'s' if s.duplicate_groups != 1 else ''} "
-                f"of similar shots; "
+                f"{s.duplicate_groups} group{plural} of similar shots{bursts}; "
                 f"{s.redundant_images} weaker alternate{'s' if s.redundant_images != 1 else ''} "
                 "you can skip"
             )
