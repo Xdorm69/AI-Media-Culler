@@ -36,7 +36,9 @@ pair (installing both is a known source of import conflicts, and no GUI is used)
 | `culler run [DIR]` | Analyse, score, write `reports/inventory.json` + `.csv` |
 | `culler scan [DIR]` | Inventory only: formats, sizes, unreadable files |
 | `culler report` | Re-display the last report |
-| `culler organize REPORT --dest OUT` | Dry-run plan; add `--apply` to copy (or `--mode move/symlink`) |
+| `culler organize REPORT --dest OUT` | Dry-run plan; add `--apply` to copy (or `--mode move/symlink`), `--group-folders` for a folder per burst |
+| `culler undo --dest OUT` | Reverse the last organize run (dry run; add `--apply`) |
+| `culler eval REPORT LABELS.csv` | Score the tool's decisions against your own labels (`--init` writes a template) |
 | `culler models download\|status` | Manage the face model |
 | `culler config init\|show\|validate` | Starter config / effective config / validation |
 | `culler doctor` | Environment check |
@@ -115,6 +117,33 @@ and tune them in `culler.yaml` (`scene`, `selection`, `bursts`, `thresholds`).
 
 Report schema is now **3** (additive). Schema-2 reports still load.
 
+## RAW, organizing safely, and measuring
+
+**RAW.** Camera RAW (`.cr2 .cr3 .nef .arw .dng .orf .raf .rw2 .pef .srw .nrw`) is decoded with `rawpy`
+(extra `formats`) at full resolution, with the camera's orientation applied. `scan.raw_half_size: true`
+is ~4x faster but reads sharpness at half resolution, so RAW and JPEG scores are less comparable.
+Without `rawpy`, a RAW file fails with a message saying what to install instead of being scored on a
+tiny embedded preview. With RAW+JPEG shooting, a JPEG beside a same-named RAW (same folder, capture
+times within 2 s) is that RAW's *companion*: it joins no group and inherits the RAW's decision, so the
+pair is never "culled" as a two-frame burst (`scan.pair_raw_jpeg`).
+
+**Organizing.** `culler organize` is a dry run until `--apply`. Copies are written to a temp file and
+checked against the SHA-256 recorded at analysis before being renamed into place; a cross-device move
+deletes its source only after that check. Nothing is overwritten. `.xmp`/`.aae`/`.pp3`/`.dop`/`.on1`/
+`.thm` sidecars and Live Photo `.mov` files travel with their photo (`--no-sidecars` to skip).
+Every run is journalled to `<dest>/.culler/undo/<time>.jsonl`; `culler undo --dest <dest> --apply`
+reverses the latest one. Undo removes a copy only if it still matches what was made and the original
+still exists, restores a moved file only if its old location is free, and skips (and tells you) anything
+else. Report schema is **4** (adds `paired_with`); older reports still load.
+
+**Measuring.** `culler eval REPORT labels.csv --init` writes a template with one row per photo. Fill in
+only what you care about: `verdict` (keep/reject), `scene`, `closed_eyes`, and `group` + `best` for the
+frame you would keep from a burst. `culler eval REPORT labels.csv` then prints false-reject rate (your
+keepers it rejected, the costly error), keep/reject precision and recall, scene accuracy, closed-eye
+precision and recall, and how often your best frame survives. Change a threshold, re-run `culler run`
+(analysis is cached), and re-run `eval` to see whether it helped. Re-scanning an unchanged library does
+not re-hash it: file hashes are remembered by path, size and modification time.
+
 ## Behaviour changes from v0.1 (deliberate)
 
 | Issue in v0.1 | Now |
@@ -142,16 +171,18 @@ Report schema is now **3** (additive). Schema-2 reports still load.
 * Horizon detection finds one dominant, near-level line. Mountains, shorelines at an angle, or
   reflections can fool it; weak detections (`scene.horizon_min_confidence`) are ignored.
 * Burst grouping needs EXIF capture time. Without it, frames group by appearance alone. A RAW+JPEG
-  pair shot together is grouped like a burst. Bursts are keyed to capture time as written, with no
+  pair is one shot (see above), but a JPEG exported *later* under another name is not recognised as
+  a companion and will group with its RAW as a duplicate. Bursts are keyed to capture time as written, with no
   time zone, so two cameras with different clock settings will not link.
 * MediaPipe landmarks carry no visibility, so that sub-score is a constant 1.0.
-* Duplicate grouping is O(n²) (vectorised; fine for ~10⁴ images, use an LSH/BK-tree beyond that).
 * Hashes detect *similar framing*, so a heavily blurred twin of a photo groups with it; that is
   intentional (the sharper one is picked as representative).
-* HEIC/HEIF is decoded through `pillow-heif` (extra `formats`). **Camera RAW is not decoded**: the RAW
-  extensions are scanned, but `rawpy` is not wired into `imaging.load_rgb`. TIFF-based RAW (DNG, NEF,
-  ARW, CR2...) may open through Pillow as a small embedded preview and be scored on that, so keep RAW
-  out of the input folder until that is implemented.
+* HEIC/HEIF is decoded through `pillow-heif` and camera RAW through `rawpy` (both in extra `formats`).
+  The RAW path is tested against a fake `rawpy` plus a CI job that installs the real one, but not yet
+  against a corpus of real RAW files from every camera maker; try a few of yours first. CR3 and recent
+  bodies depend on your installed LibRaw version.
+* Duplicate grouping is vectorised but still compares every leader with every image: ~1.4 s for 20,000
+  random hashes, growing quadratically. Real libraries cluster, so it is usually faster.
 
 ## Development
 
