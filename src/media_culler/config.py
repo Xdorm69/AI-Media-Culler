@@ -64,6 +64,11 @@ class ScanConfig(_Section):
     exclude_dirs: list[str] = [".git", "__pycache__", ".culler_cache"]
     # Safety limit against decompression bombs / accidental gigapixel panoramas.
     max_pixels: int = Field(250_000_000, gt=0)
+    # Camera RAW is decoded with rawpy. Half-size is ~4x faster but halves the resolution the
+    # sharpness readings are taken at, so RAW and JPEG scores are less comparable.
+    raw_half_size: bool = False
+    # A RAW file with a same-named JPEG beside it (RAW+JPEG shooting) is ONE shot, not a burst.
+    pair_raw_jpeg: bool = True
 
     @field_validator("extensions")
     @classmethod
@@ -326,6 +331,8 @@ scan:
   follow_symlinks: false
   exclude_dirs: [.git, __pycache__, .culler_cache]
   max_pixels: 250000000             # refuse images larger than this (decompression-bomb guard)
+  raw_half_size: false              # faster RAW decode, but sharpness is read at half resolution
+  pair_raw_jpeg: true               # a RAW with a same-named JPEG beside it is one shot
 
 thresholds:                         # final score (0-100) cut-offs
   select: 80

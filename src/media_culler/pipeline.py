@@ -19,9 +19,10 @@ from media_culler.config import Settings
 from media_culler.curation import apply_recommendations, rank_collection, select_best_shots
 from media_culler.duplicates import assign_duplicate_groups
 from media_culler.exceptions import AnalyzerUnavailable, ImageLoadError
-from media_culler.imaging import ImageContext, configure_pillow
+from media_culler.imaging import ImageContext, configure_pillow, configure_raw
 from media_culler.logging_setup import silence_third_party
 from media_culler.models import ImageRecord
+from media_culler.pairing import inherit_companion_decisions, link_raw_companions
 from media_culler.progress import NullReporter, ProgressReporter
 from media_culler.scanner import scan_directory
 from media_culler.scoring import score_record
@@ -80,6 +81,7 @@ class Pipeline:
         started_at = datetime.now(timezone.utc).isoformat()
         root = input_directory or self.settings.paths.input_directory
         configure_pillow(self.settings.scan.max_pixels)
+        configure_raw(self.settings.scan.raw_half_size)
 
         records = scan_directory(root, self.settings, self.reporter)
         result = RunResult(
@@ -235,11 +237,20 @@ class Pipeline:
 
     def _curate(self, result: RunResult) -> None:
         records = result.records
+        if self.settings.scan.pair_raw_jpeg:
+            link_raw_companions(records)
+        else:
+            for record in records:
+                record.paired_with = None
+        # Companions are scored (their own numbers stay visible) but take no part in grouping,
+        # ranking or best-shot choice: they inherit the RAW's decision afterwards.
+        shots = [r for r in records if r.paired_with is None]
+
         duplicates, bursts = self.settings.duplicates, self.settings.bursts
         if duplicates.enabled or bursts.enabled:
             self.reporter.stage("Grouping similar images", None)
             result.duplicate_groups = assign_duplicate_groups(
-                records,
+                shots,
                 duplicates.hamming_threshold if duplicates.enabled else None,
                 bursts,
             )
@@ -247,6 +258,7 @@ class Pipeline:
         for record in records:
             if record.status == "valid":
                 record.scores = score_record(record, self.settings)
-        rank_collection(records)
+        rank_collection(shots)
         apply_recommendations(records, self.settings.thresholds)
-        select_best_shots(records, self.settings.selection)
+        select_best_shots(shots, self.settings.selection)
+        inherit_companion_decisions(records)

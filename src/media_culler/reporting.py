@@ -17,8 +17,8 @@ from media_culler.exceptions import ReportError
 from media_culler.models import GroupKind, GroupRole, ImageRecord, Recommendation
 from media_culler.pipeline import RunResult
 
-SCHEMA_VERSION = 3
-_READABLE_SCHEMAS = {2, 3}  # v3 only adds fields; v2 reports load with defaults
+SCHEMA_VERSION = 4
+_READABLE_SCHEMAS = {2, 3, 4}  # v3/v4 only add fields; older reports load with defaults
 
 
 class TopImage(BaseModel):
@@ -92,7 +92,9 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int 
         recommendations=dict(sorted(counts.items())),
         duplicate_groups=duplicate_groups,
         images_in_duplicate_groups=sum(1 for r in valid if r.duplicate_group is not None),
-        redundant_images=sum(1 for r in valid if r.group_role == GroupRole.SIMILAR),
+        redundant_images=sum(
+            1 for r in valid if r.group_role == GroupRole.SIMILAR and r.paired_with is None
+        ),
         mean_score=round(statistics.fmean(values), 2) if values else None,
         median_score=round(statistics.median(values), 2) if values else None,
         analyzer_failures=failures,
@@ -166,6 +168,7 @@ CSV_COLUMNS = [
     "closed_eyes",
     "duplicate_group",
     "group_kind",
+    "paired_with",
     "captured_at",
     "group_role",
     "width",
@@ -195,6 +198,7 @@ def _csv_row(r: ImageRecord) -> dict[str, Any]:
         "closed_eyes": len(s.group.closed_eyes) if s and s.group else None,
         "duplicate_group": r.duplicate_group,
         "group_kind": r.group_kind.value if r.group_kind else "",
+        "paired_with": r.paired_with or "",
         "captured_at": r.captured_at or "",
         "group_role": r.group_role.value if r.group_role else "",
         "width": r.width,

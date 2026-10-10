@@ -172,6 +172,10 @@ class ImageRecord(BaseModel):
     collection_size: int | None = None
     collection_percentile: float | None = None
 
+    # Set on a JPEG that is the companion of a RAW file (RAW+JPEG shooting): the RAW's
+    # relative_path. The companion takes part in no group; it inherits the RAW's decisions.
+    paired_with: str | None = None
+
     duplicate_group: int | None = None
     duplicate_group_size: int = 1
     group_kind: GroupKind | None = None

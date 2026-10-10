@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -26,6 +28,23 @@ try:  # optional: pip install 'ai-media-culler[formats]'
     HEIF_AVAILABLE = True
 except ImportError:  # core install: HEIC/HEIF files simply fail to open (reported per file)
     HEIF_AVAILABLE = False
+
+try:  # optional, same extra as pillow-heif
+    import rawpy as _rawpy
+
+    rawpy: Any = _rawpy  # untyped on purpose: its stubs differ between releases
+    RAW_AVAILABLE = True
+except ImportError:
+    rawpy = None
+    RAW_AVAILABLE = False
+
+# Camera RAW containers. Pillow can open some of these (TIFF-based ones) but only as a
+# small embedded preview, which would be scored as if it were the photo: decode with rawpy.
+RAW_EXTENSIONS = frozenset(
+    {".arw", ".cr2", ".cr3", ".dng", ".nef", ".nrw", ".orf", ".pef", ".raf", ".rw2", ".srw"}
+)
+_RAW_FLIPS_SWAPPING = {5, 6}  # LibRaw flip codes that rotate by 90 degrees
+_raw_half_size = False
 
 EXIF_ORIENTATION = 0x0112
 _EXIF_IFD = 0x8769
@@ -47,6 +66,16 @@ class ImageHeader:
 def configure_pillow(max_pixels: int) -> None:
     """Align Pillow's decompression-bomb guard with our configured limit."""
     Image.MAX_IMAGE_PIXELS = max_pixels
+
+
+def configure_raw(half_size: bool) -> None:
+    """Choose RAW decode resolution: half-size is ~4x faster but changes sharpness readings."""
+    global _raw_half_size
+    _raw_half_size = half_size
+
+
+def is_raw(path: Path) -> bool:
+    return path.suffix.lower() in RAW_EXTENSIONS
 
 
 def sha256_file(path: Path) -> str:
@@ -88,8 +117,67 @@ def parse_capture_time(exif: Image.Exif) -> str | None:
     return None
 
 
+def _require_rawpy() -> None:
+    if not RAW_AVAILABLE:
+        raise ImageLoadError("RAW decoding needs rawpy: pip install 'ai-media-culler[formats]'")
+
+
+def _raw_capture_time(path: Path, raw: Any) -> str | None:
+    """EXIF capture time of a RAW file: the container's own EXIF, else its embedded preview's."""
+    try:
+        with Image.open(path) as image:  # TIFF-based RAW (DNG, NEF, ARW, CR2...)
+            moment = parse_capture_time(image.getexif())
+        if moment:
+            return moment
+    except Exception:
+        pass
+    try:
+        thumb = raw.extract_thumb()
+        if thumb.format == rawpy.ThumbFormat.JPEG:
+            with Image.open(io.BytesIO(thumb.data)) as preview:
+                return parse_capture_time(preview.getexif())
+    except Exception:
+        pass
+    return None
+
+
+def _read_raw_header(path: Path, max_pixels: int) -> ImageHeader:
+    _require_rawpy()
+    try:
+        with rawpy.imread(str(path)) as raw:
+            width, height = int(raw.sizes.width), int(raw.sizes.height)
+            flip = int(raw.sizes.flip)
+            captured_at = _raw_capture_time(path, raw)
+    except Exception as error:
+        raise ImageLoadError(f"Cannot open RAW file: {error}") from error
+    if width * height > max_pixels:
+        raise ImageLoadError(f"Image too large ({width}x{height} > {max_pixels} pixels)")
+    if flip in _RAW_FLIPS_SWAPPING:
+        width, height = height, width
+    return ImageHeader(width=width, height=height, format="RAW", captured_at=captured_at)
+
+
+def _load_raw(path: Path, max_pixels: int) -> np.ndarray:
+    _require_rawpy()
+    try:
+        with rawpy.imread(str(path)) as raw:
+            if raw.sizes.width * raw.sizes.height > max_pixels:
+                raise ImageLoadError(
+                    f"Image too large ({raw.sizes.width}x{raw.sizes.height} > {max_pixels} pixels)"
+                )
+            # LibRaw applies the camera's orientation flag itself.
+            rgb = raw.postprocess(use_camera_wb=True, half_size=_raw_half_size, output_bps=8)
+    except ImageLoadError:
+        raise
+    except Exception as error:
+        raise ImageLoadError(f"Cannot decode RAW file: {error}") from error
+    return np.ascontiguousarray(rgb, dtype=np.uint8)
+
+
 def read_header(path: Path, max_pixels: int) -> ImageHeader:
     """Read dimensions/format without decoding pixels. Raises ImageLoadError."""
+    if is_raw(path):
+        return _read_raw_header(path, max_pixels)
     try:
         with Image.open(path) as image:
             width, height = image.size
@@ -109,6 +197,11 @@ def read_header(path: Path, max_pixels: int) -> ImageHeader:
 
 def load_rgb(path: Path, max_pixels: int) -> np.ndarray:
     """Decode to an orientation-corrected, C-contiguous uint8 RGB array (H, W, 3)."""
+    if is_raw(path):
+        array = _load_raw(path, max_pixels)
+        if array.ndim != 3 or array.shape[0] == 0 or array.shape[1] == 0:
+            raise ImageLoadError("Decoded image has invalid shape")
+        return array
     try:
         with Image.open(path) as image:
             if image.width * image.height > max_pixels:
