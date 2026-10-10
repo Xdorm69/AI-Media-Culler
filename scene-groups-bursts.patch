@@ -1,0 +1,3110 @@
+From 5a841c7cc5e95f9c2eefa4f57e5d650791ed0015 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 9 Oct 2026 05:20:01 +0000
+Subject: [PATCH 1/5] fix: keep pillow-heif optional and default extensions
+ canonical
+
+pillow-heif is only in the 'formats' extra but was imported unconditionally,
+so 'import media_culler' crashed on a core install (and in CI, which installs
+.[dev]). Guard the import and expose HEIF_AVAILABLE.
+
+The new default extension list was not in the sorted form the validator
+produces, which turned test_shipped_template_matches_defaults red.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ src/media_culler/config.py  | 26 ++++++++++++--------------
+ src/media_culler/imaging.py |  9 +++++++--
+ tests/test_imaging.py       | 13 +++++++++++++
+ 3 files changed, 32 insertions(+), 16 deletions(-)
+
+diff --git a/src/media_culler/config.py b/src/media_culler/config.py
+index 6a976af..7967302 100644
+--- a/src/media_culler/config.py
++++ b/src/media_culler/config.py
+@@ -39,27 +39,25 @@ class PathsConfig(_Section):
+ 
+ class ScanConfig(_Section):
+     extensions: list[str] = [
++        ".arw",
+         ".bmp",
+-        ".jpeg",
+-        ".jpg",
+-        ".png",
+-        ".tif",
+-        ".tiff",
+-        ".webp",
+-        # HEIC / HEIF
+-        ".heic",
+-        ".heif",
+-        # Camera RAW
+-        ".dng",
+         ".cr2",
+         ".cr3",
++        ".dng",
++        ".heic",
++        ".heif",
++        ".jpeg",
++        ".jpg",
+         ".nef",
+-        ".arw",
+         ".orf",
+-        ".rw2",
+-        ".raf",
+         ".pef",
++        ".png",
++        ".raf",
++        ".rw2",
+         ".srw",
++        ".tif",
++        ".tiff",
++        ".webp",
+     ]
+     recursive: bool = True
+     follow_symlinks: bool = False
+diff --git a/src/media_culler/imaging.py b/src/media_culler/imaging.py
+index ff8fa45..29413ea 100644
+--- a/src/media_culler/imaging.py
++++ b/src/media_culler/imaging.py
+@@ -14,12 +14,17 @@ from pathlib import Path
+ 
+ import cv2
+ import numpy as np
+-import pillow_heif
+ from PIL import Image, ImageOps
+ 
+ from media_culler.exceptions import ImageLoadError
+ 
+-pillow_heif.register_heif_opener()
++try:  # optional: pip install 'ai-media-culler[formats]'
++    import pillow_heif
++
++    pillow_heif.register_heif_opener()
++    HEIF_AVAILABLE = True
++except ImportError:  # core install: HEIC/HEIF files simply fail to open (reported per file)
++    HEIF_AVAILABLE = False
+ 
+ EXIF_ORIENTATION = 0x0112
+ _SWAPPED_ORIENTATIONS = {5, 6, 7, 8}
+diff --git a/tests/test_imaging.py b/tests/test_imaging.py
+index 44ca38f..d4641a2 100644
+--- a/tests/test_imaging.py
++++ b/tests/test_imaging.py
+@@ -97,3 +97,16 @@ def test_phash_is_stable_across_exif_rotation(tmp_path):
+     upright = load_rgb(_oriented(tmp_path, 1), 10**9)
+     rotated = load_rgb(_oriented(tmp_path, 1), 10**9)
+     assert perceptual_hash(upright) == perceptual_hash(rotated)
++
++
++def test_core_import_works_without_pillow_heif():
++    """Regression: pillow-heif lives in an optional extra; core installs must still import."""
++    import subprocess
++    import sys
++
++    code = (
++        "import sys; sys.modules['pillow_heif'] = None; "
++        "import media_culler.imaging as m; assert m.HEIF_AVAILABLE is False"
++    )
++    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
++    assert result.returncode == 0, result.stderr
+-- 
+2.43.0
+
+
+From 06055e82f42f744342b62f49656cad280730742a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 9 Oct 2026 12:32:41 +0000
+Subject: [PATCH 2/5] feat: landscape-aware scoring
+
+Photos without prominent faces were judged by portrait rules: mean-brightness
+exposure punished sunsets and snow, global Laplacian variance made crisp scenes
+with empty sky look blurry, and subject/composition were a flat neutral 50.
+
+- SceneAnalyzer (OpenCV/NumPy, thread-safe): horizon line (Hough, mode-clustered,
+  signed tilt + position + confidence), highlight/shadow clipping, dynamic range,
+  upper-quartile tiled sharpness, spectral-residual saliency centroid
+- classify_scene: people / landscape / general. A face only makes a photo
+  'people' when large enough to be the subject (scene.people_min_face_area)
+- Landscapes use clipping-based exposure, dynamic range instead of contrast,
+  tiled sharpness (never lower than global), and horizon level/placement +
+  focal-point composition. Subject is excluded from the weighted mean
+- Soft-focus gate caps landscapes at 'review' so good composition cannot
+  rescue an out-of-focus frame (thresholds.soft_focus_sharpness)
+- Report schema 3 (additive; schema 2 still loads): scene_type, scene_counts,
+  CSV 'scene' column, terminal scene mix line
+
+Non-landscape scoring is unchanged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ src/media_culler/analyzers/__init__.py |   3 +
+ src/media_culler/analyzers/scene.py    | 161 +++++++++++
+ src/media_culler/config.py             |  29 ++
+ src/media_culler/curation.py           |  18 +-
+ src/media_culler/labels.py             |   2 +
+ src/media_culler/models.py             |  28 ++
+ src/media_culler/reporting.py          |  17 +-
+ src/media_culler/scoring/final.py      |  27 +-
+ src/media_culler/scoring/landscape.py  |  89 ++++++
+ src/media_culler/scoring/scene.py      |  33 +++
+ src/media_culler/scoring/technical.py  |  11 +-
+ src/media_culler/ui/render.py          |   3 +
+ tests/conftest.py                      |  32 +++
+ tests/test_landscape.py                | 383 +++++++++++++++++++++++++
+ 14 files changed, 828 insertions(+), 8 deletions(-)
+ create mode 100644 src/media_culler/analyzers/scene.py
+ create mode 100644 src/media_culler/scoring/landscape.py
+ create mode 100644 src/media_culler/scoring/scene.py
+ create mode 100644 tests/test_landscape.py
+
+diff --git a/src/media_culler/analyzers/__init__.py b/src/media_culler/analyzers/__init__.py
+index 7e60a1c..25e2578 100644
+--- a/src/media_culler/analyzers/__init__.py
++++ b/src/media_culler/analyzers/__init__.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ from media_culler.analyzers.base import Analyzer
+ from media_culler.analyzers.faces import FaceAnalyzer
++from media_culler.analyzers.scene import SceneAnalyzer
+ from media_culler.analyzers.technical import TechnicalAnalyzer
+ from media_culler.analyzers.vision import VisionAnalyzer
+ from media_culler.config import Settings
+@@ -12,6 +13,8 @@ from media_culler.config import Settings
+ def build_analyzers(settings: Settings) -> list[Analyzer]:
+     """Instantiate (but do not set up) analyzers enabled by ``settings``."""
+     analyzers: list[Analyzer] = [TechnicalAnalyzer()]
++    if settings.scene.enabled:
++        analyzers.append(SceneAnalyzer())
+     if settings.vision.enabled:
+         analyzers.append(VisionAnalyzer(settings.vision))
+     if settings.faces.enabled:
+diff --git a/src/media_culler/analyzers/scene.py b/src/media_culler/analyzers/scene.py
+new file mode 100644
+index 0000000..2f71b59
+--- /dev/null
++++ b/src/media_culler/analyzers/scene.py
+@@ -0,0 +1,161 @@
++"""Scene-level metrics for landscape-aware scoring.
++
++OpenCV + NumPy only, so it is thread-safe and runs in the decode workers next to the
++technical analyzer. Everything except tiled sharpness runs on a downscaled copy.
++"""
++
++from __future__ import annotations
++
++from math import atan2, degrees, pi
++from typing import ClassVar
++
++import cv2
++import numpy as np
++
++from media_culler.analyzers.base import Analyzer
++from media_culler.imaging import ImageContext, resize_max_side
++from media_culler.models import HorizonInfo, SceneMetrics
++
++_ANALYSIS_SIDE = 1024
++_HORIZON_SIDE = 640
++_MAX_TILT_DEG = 15.0  # steeper lines are intentional angles or other structure, not a horizon
++_CLUSTER_DEG = 2.0  # segments within this of the dominant angle may belong to the horizon
++_CANNY = (40, 120)
++_MAX_SEGMENTS = 400
++_LINE_BAND = 0.03  # ...and must also lie within this fraction of frame height of each other
++_GRID = 4
++_SHARPNESS_PERCENTILE = 75
++_SALIENCY_SIDE = 64
++
++
++def detect_horizon(gray: np.ndarray) -> HorizonInfo | None:
++    """Find the dominant near-horizontal line, or None if there is no convincing one."""
++    small = resize_max_side(gray, _HORIZON_SIDE)
++    height, width = small.shape[:2]
++    blurred = cv2.GaussianBlur(small, (5, 5), 0)
++    # Fixed thresholds on purpose: median-derived ones over-trigger on dark, textured frames
++    # and flood Hough with ground-texture fragments. A horizon is a long, high-contrast edge.
++    edges = cv2.Canny(blurred, *_CANNY)
++
++    lines = cv2.HoughLinesP(
++        edges,
++        rho=1,
++        theta=pi / 720,
++        threshold=max(20, int(0.2 * width)),
++        minLineLength=int(0.35 * width),
++        maxLineGap=max(4, int(0.04 * width)),
++    )
++    if lines is None:
++        return None
++
++    # angle, length, y at frame centre (extrapolated, 0-1), x start, x end
++    segments: list[tuple[float, float, float, float, float]] = []
++    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):  # (N,4) or (N,1,4) by version
++        if x2 == x1:
++            continue
++        if x2 < x1:  # always read left to right so the sign is meaningful
++            x1, y1, x2, y2 = x2, y2, x1, y1
++        angle = degrees(atan2(float(y2 - y1), float(x2 - x1)))
++        if abs(angle) > _MAX_TILT_DEG:
++            continue
++        length = float(np.hypot(x2 - x1, y2 - y1))
++        slope = (y2 - y1) / (x2 - x1)
++        centre_y = ((y1 + y2) / 2 + slope * (width / 2 - (x1 + x2) / 2)) / height
++        segments.append((angle, length, centre_y, float(x1), float(x2)))
++    if not segments:
++        return None
++
++    # Textured ground produces many short near-horizontal fragments at other heights and
++    # angles. Pick the mode, not a median: the (angle, height) cell with the most total
++    # supporting segment length. Candidates are capped so this stays O(n^2) on small n.
++    segments.sort(key=lambda s: s[1], reverse=True)
++    segments = segments[:_MAX_SEGMENTS]
++    total_length = sum(s[1] for s in segments)
++    angles = np.array([s[0] for s in segments])
++    lengths = np.array([s[1] for s in segments])
++    centres = np.array([s[2] for s in segments])
++    near = (np.abs(angles[:, None] - angles[None, :]) <= _CLUSTER_DEG) & (
++        np.abs(centres[:, None] - centres[None, :]) <= _LINE_BAND
++    )
++    best = int(np.argmax(near @ lengths))
++    kept = [segments[i] for i in np.flatnonzero(near[best])]
++    kept_length = sum(s[1] for s in kept)
++    angle = sum(s[0] * s[1] for s in kept) / kept_length
++    y = sum(s[2] * s[1] for s in kept) / kept_length
++
++    covered = np.zeros(width, dtype=bool)  # union of x-ranges: overlapping Hough lines count once
++    for _, _, _, x0, x1 in kept:
++        covered[int(x0) : int(x1) + 1] = True
++    coverage = float(covered.mean())
++    consistency = kept_length / total_length
++    return HorizonInfo(
++        angle_deg=round(angle, 3),
++        y=round(float(np.clip(y, 0.0, 1.0)), 4),
++        confidence=round(coverage * consistency, 4),
++    )
++
++
++def saliency_centroid(gray: np.ndarray) -> tuple[float, float]:
++    """Centroid (x, y in 0-1) of the most salient region (spectral-residual saliency)."""
++    small = cv2.resize(gray, (_SALIENCY_SIDE, _SALIENCY_SIDE), interpolation=cv2.INTER_AREA)
++    spectrum = np.fft.fft2(small.astype(np.float32))
++    log_amplitude = np.log(np.abs(spectrum) + 1e-8).astype(np.float32)
++    residual = log_amplitude - cv2.blur(log_amplitude, (3, 3))
++    saliency = np.abs(np.fft.ifft2(np.exp(residual + 1j * np.angle(spectrum)))) ** 2
++    saliency = cv2.GaussianBlur(saliency.astype(np.float32), (0, 0), 3)
++
++    mask = saliency > saliency.mean() + saliency.std()
++    if not mask.any():
++        return 0.5, 0.5
++    ys, xs = np.nonzero(mask)
++    weights = saliency[mask].astype(np.float64)
++    total = float(weights.sum())
++    cx = float((xs + 0.5) @ weights / total / _SALIENCY_SIDE)
++    cy = float((ys + 0.5) @ weights / total / _SALIENCY_SIDE)
++    return round(cx, 4), round(cy, 4)
++
++
++def tiled_sharpness(gray: np.ndarray, grid: int = _GRID) -> float:
++    """Upper-quartile tile Laplacian variance.
++
++    Global Laplacian variance averages in smooth sky, water and fog, so a crisp landscape
++    with a big empty sky looks "blurry". The 75th-percentile tile ignores those regions
++    while a genuinely soft or motion-blurred frame is soft in *every* tile.
++    """
++    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
++    height, width = laplacian.shape
++    tile_h, tile_w = height // grid, width // grid
++    if tile_h < 8 or tile_w < 8:
++        _, std = cv2.meanStdDev(laplacian)
++        return float(std[0][0] ** 2)
++    variances = []
++    for row in range(grid):
++        for col in range(grid):
++            tile = laplacian[row * tile_h : (row + 1) * tile_h, col * tile_w : (col + 1) * tile_w]
++            _, std = cv2.meanStdDev(tile)
++            variances.append(float(std[0][0] ** 2))
++    return float(np.percentile(variances, _SHARPNESS_PERCENTILE))
++
++
++class SceneAnalyzer(Analyzer):
++    name: ClassVar[str] = "scene"
++    section: ClassVar[str] = "scene"
++    result_type = SceneMetrics
++    version: ClassVar[str] = "1"
++    thread_safe: ClassVar[bool] = True
++
++    def analyze(self, ctx: ImageContext) -> SceneMetrics:
++        small_rgb = resize_max_side(ctx.rgb, _ANALYSIS_SIDE)
++        small_gray = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2GRAY)
++        brightest = small_rgb.max(axis=2)
++        low, high = np.percentile(small_gray, [1, 99])
++        cx, cy = saliency_centroid(small_gray)
++        return SceneMetrics(
++            horizon=detect_horizon(small_gray),
++            highlight_clip=round(float(np.mean(brightest >= 250)), 5),
++            shadow_clip=round(float(np.mean(brightest <= 5)), 5),
++            dynamic_range=round(float(high - low), 2),
++            sharpness_focus=round(tiled_sharpness(ctx.gray), 2),
++            saliency_x=cx,
++            saliency_y=cy,
++        )
+diff --git a/src/media_culler/config.py b/src/media_culler/config.py
+index 7967302..5408738 100644
+--- a/src/media_culler/config.py
++++ b/src/media_culler/config.py
+@@ -81,6 +81,9 @@ class ThresholdsConfig(_Section):
+     review: float = Field(45, ge=0, le=100)
+     # Images whose technical score is below this are rejected regardless of other scores.
+     technical_floor: float = Field(25, ge=0, le=100)
++    # Landscapes whose sharpness sub-score (0-100) is below this are capped at "review", however
++    # well composed: a level horizon must not rescue an out-of-focus frame. 0 disables the gate.
++    soft_focus_sharpness: float = Field(12, ge=0, le=100)
+ 
+     @model_validator(mode="after")
+     def _ordered(self) -> ThresholdsConfig:
+@@ -134,6 +137,22 @@ class FacesConfig(_Section):
+     max_side: int = Field(1920, ge=256)
+ 
+ 
++class SceneConfig(_Section):
++    """Landscape-aware scoring."""
++
++    enabled: bool = True
++    # Minimum AI confidence (0-100) for the top content label to count as "landscape".
++    # SigLIP probabilities are uncalibrated, so the default is "top label wins".
++    landscape_min_confidence: float = Field(0.0, ge=0, le=100)
++    # A face covering at least this fraction of the frame makes the photo "people", not landscape.
++    people_min_face_area: float = Field(0.01, ge=0, le=1)
++    # Horizon lines below this confidence are ignored when scoring composition.
++    horizon_min_confidence: float = Field(0.35, ge=0, le=1)
++    # Without AI, a very confident horizon and no real faces is treated as a landscape.
++    heuristic_without_ai: bool = True
++    heuristic_horizon_confidence: float = Field(0.6, ge=0, le=1)
++
++
+ class PerformanceConfig(_Section):
+     # Worker threads for scanning/hashing and for decode + OpenCV analysis prefetch.
+     workers: int = Field(4, ge=1, le=64)
+@@ -148,6 +167,7 @@ class Settings(_Section):
+     duplicates: DuplicatesConfig = DuplicatesConfig()
+     vision: VisionConfig = VisionConfig()
+     faces: FacesConfig = FacesConfig()
++    scene: SceneConfig = SceneConfig()
+     performance: PerformanceConfig = PerformanceConfig()
+ 
+     @property
+@@ -268,6 +288,7 @@ thresholds:                         # final score (0-100) cut-offs
+   usable: 65
+   review: 45
+   technical_floor: 25               # below this technical score => always reject_candidate
++  soft_focus_sharpness: 12          # landscapes softer than this sub-score are capped at review
+ 
+ weights:                            # relative; normalised over available components
+   technical: 0.40
+@@ -294,6 +315,14 @@ faces:                              # needs: pip install 'ai-media-culler[faces]
+   model_sha256: null                # optional integrity check for `culler models download`
+   max_side: 1920
+ 
++scene:                              # landscape-aware scoring
++  enabled: true
++  landscape_min_confidence: 0.0     # AI confidence (0-100) needed to call a photo a landscape
++  people_min_face_area: 0.01        # faces larger than this fraction of the frame => "people"
++  horizon_min_confidence: 0.35      # ignore weaker horizon detections
++  heuristic_without_ai: true        # guess "landscape" from a strong horizon when AI is off
++  heuristic_horizon_confidence: 0.6
++
+ performance:
+   workers: 4
+   use_cache: true
+diff --git a/src/media_culler/curation.py b/src/media_culler/curation.py
+index 9616c46..8e3e6e9 100644
+--- a/src/media_culler/curation.py
++++ b/src/media_culler/curation.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ from media_culler.config import ThresholdsConfig
+-from media_culler.models import GroupRole, ImageRecord, Recommendation
++from media_culler.models import GroupRole, ImageRecord, Recommendation, SceneType
+ 
+ 
+ def _scored(records: list[ImageRecord]) -> list[ImageRecord]:
+@@ -23,6 +23,20 @@ def rank_collection(records: list[ImageRecord]) -> None:
+         record.collection_percentile = round((total - index) / total * 100, 2)
+ 
+ 
++def _soft_focus_landscape(record: ImageRecord, thresholds: ThresholdsConfig) -> bool:
++    """Landscape whose (tiled) sharpness sub-score is below the gate.
++
++    Landscape-only on purpose: a portrait with creamy bokeh has low *global* sharpness
++    while its face is crisp, so the same rule would wrongly demote it.
++    """
++    scores = record.scores
++    if scores is None or scores.scene_type is not SceneType.LANDSCAPE:
++        return False
++    technical = scores.details.get("technical")
++    sharpness = technical.get("sharpness") if isinstance(technical, dict) else None
++    return sharpness is not None and sharpness < thresholds.soft_focus_sharpness
++
++
+ def classify(record: ImageRecord, thresholds: ThresholdsConfig) -> tuple[Recommendation, str]:
+     final = record.final_score
+     technical = record.scores.technical if record.scores else None
+@@ -30,6 +44,8 @@ def classify(record: ImageRecord, thresholds: ThresholdsConfig) -> tuple[Recomme
+         return Recommendation.UNSCORED, "Analysis incomplete; no score available"
+     if technical < thresholds.technical_floor:
+         return Recommendation.REJECT, "Very low technical quality"
++    if _soft_focus_landscape(record, thresholds) and final >= thresholds.review:
++        return Recommendation.REVIEW, "Landscape is soft/out of focus; check before keeping"
+     if final >= thresholds.select:
+         return Recommendation.SELECT, "High overall photographic score"
+     if final >= thresholds.usable:
+diff --git a/src/media_culler/labels.py b/src/media_culler/labels.py
+index d43edd6..89fcf5f 100644
+--- a/src/media_culler/labels.py
++++ b/src/media_culler/labels.py
+@@ -25,6 +25,8 @@ AESTHETIC_LABELS = [
+     "an ordinary photograph",
+ ]
+ 
++LANDSCAPE_LABEL = CONTENT_LABELS[1]
++
+ # Order matters: it defines how a flat score vector is split back into groups.
+ LABEL_GROUPS: dict[str, list[str]] = {
+     "content": CONTENT_LABELS,
+diff --git a/src/media_culler/models.py b/src/media_culler/models.py
+index 70aa972..e3df81c 100644
+--- a/src/media_culler/models.py
++++ b/src/media_culler/models.py
+@@ -16,6 +16,12 @@ class Recommendation(str, Enum):
+     UNSCORED = "unscored"
+ 
+ 
++class SceneType(str, Enum):
++    PEOPLE = "people"
++    LANDSCAPE = "landscape"
++    GENERAL = "general"
++
++
+ class GroupRole(str, Enum):
+     UNIQUE = "unique"
+     REPRESENTATIVE = "representative"
+@@ -76,6 +82,26 @@ class FaceAnalysis(BaseModel):
+     faces: list[FaceInfo] = Field(default_factory=list)
+ 
+ 
++class HorizonInfo(BaseModel):
++    """A dominant near-horizontal line (sea/sky/ground boundary)."""
++
++    angle_deg: float  # signed tilt; 0 = level. Positive = right side lower (clockwise)
++    y: float  # vertical position, 0 = top edge, 1 = bottom edge
++    confidence: float  # 0-1: how much of the frame width the line spans, and how consistent it is
++
++
++class SceneMetrics(BaseModel):
++    """Scene-level measurements used by landscape-aware scoring."""
++
++    horizon: HorizonInfo | None = None
++    highlight_clip: float  # fraction of pixels with any channel >= 250
++    shadow_clip: float  # fraction of pixels with every channel <= 5
++    dynamic_range: float  # 99th - 1st luminance percentile (0-255)
++    sharpness_focus: float  # 75th-percentile tile Laplacian variance (ignores smooth sky/water)
++    saliency_x: float  # centroid of the most salient region, 0-1 from the left
++    saliency_y: float
++
++
+ # ------------------------------------------------------------------------- scores
+ 
+ 
+@@ -85,6 +111,7 @@ class Scores(BaseModel):
+     subject: float | None = None
+     composition: float | None = None
+     final: float | None = None
++    scene_type: SceneType | None = None
+     # Normalised weights actually applied (components that were unavailable are absent).
+     weights_used: dict[str, float] = Field(default_factory=dict)
+     details: dict[str, Any] = Field(default_factory=dict)
+@@ -111,6 +138,7 @@ class ImageRecord(BaseModel):
+     technical: TechnicalMetrics | None = None
+     ai: AIAssessment | None = None
+     faces: FaceAnalysis | None = None
++    scene: SceneMetrics | None = None
+     analyzer_errors: dict[str, str] = Field(default_factory=dict)
+ 
+     scores: Scores | None = None
+diff --git a/src/media_culler/reporting.py b/src/media_culler/reporting.py
+index 6d7a933..98fba02 100644
+--- a/src/media_culler/reporting.py
++++ b/src/media_culler/reporting.py
+@@ -10,14 +10,15 @@ import tempfile
+ from pathlib import Path
+ from typing import Any
+ 
+-from pydantic import BaseModel, ValidationError
++from pydantic import BaseModel, Field, ValidationError
+ 
+ from media_culler import __version__
+ from media_culler.exceptions import ReportError
+ from media_culler.models import GroupRole, ImageRecord, Recommendation
+ from media_culler.pipeline import RunResult
+ 
+-SCHEMA_VERSION = 2
++SCHEMA_VERSION = 3
++_READABLE_SCHEMAS = {2, 3}  # v3 only adds fields; v2 reports load with defaults
+ 
+ 
+ class TopImage(BaseModel):
+@@ -39,6 +40,7 @@ class Summary(BaseModel):
+     mean_score: float | None
+     median_score: float | None
+     analyzer_failures: dict[str, int]
++    scene_counts: dict[str, int] = Field(default_factory=dict)
+     top: list[TopImage]
+ 
+ 
+@@ -71,6 +73,12 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int
+         for name in record.analyzer_errors:
+             failures[name] = failures.get(name, 0) + 1
+ 
++    scenes: dict[str, int] = {}
++    for record in valid:
++        if record.scores and record.scores.scene_type:
++            key = record.scores.scene_type.value
++            scenes[key] = scenes.get(key, 0) + 1
++
+     values = [r.final_score for r in scored if r.final_score is not None]
+     return Summary(
+         total_files=len(records),
+@@ -84,6 +92,7 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int
+         mean_score=round(statistics.fmean(values), 2) if values else None,
+         median_score=round(statistics.median(values), 2) if values else None,
+         analyzer_failures=failures,
++        scene_counts=dict(sorted(scenes.items())),
+         top=[
+             TopImage(
+                 filename=r.filename,
+@@ -137,6 +146,7 @@ CSV_COLUMNS = [
+     "filename",
+     "relative_path",
+     "recommendation",
++    "scene",
+     "final_score",
+     "technical",
+     "ai",
+@@ -161,6 +171,7 @@ def _csv_row(r: ImageRecord) -> dict[str, Any]:
+         "filename": r.filename,
+         "relative_path": r.relative_path,
+         "recommendation": r.recommendation.value if r.recommendation else "",
++        "scene": s.scene_type.value if s and s.scene_type else "",
+         "final_score": s.final if s else None,
+         "technical": s.technical if s else None,
+         "ai": s.ai if s else None,
+@@ -214,7 +225,7 @@ def load_report(path: Path) -> Report:
+             f"{path} is a v0.1 report (bare list). "
+             f"Re-run `culler run` to produce a v{SCHEMA_VERSION} report."
+         )
+-    if data.get("schema_version") != SCHEMA_VERSION:
++    if data.get("schema_version") not in _READABLE_SCHEMAS:
+         raise ReportError(
+             f"Unsupported report schema {data.get('schema_version')!r} (expected {SCHEMA_VERSION})."
+         )
+diff --git a/src/media_culler/scoring/final.py b/src/media_culler/scoring/final.py
+index d97d788..1ceefb9 100644
+--- a/src/media_culler/scoring/final.py
++++ b/src/media_culler/scoring/final.py
+@@ -1,9 +1,11 @@
+ from __future__ import annotations
+ 
+ from media_culler.config import Settings, WeightsConfig
+-from media_culler.models import ImageRecord, Scores
++from media_culler.models import ImageRecord, SceneType, Scores
+ from media_culler.scoring.ai import score_ai
+ from media_culler.scoring.composition import score_composition
++from media_culler.scoring.landscape import score_landscape_composition, technical_overrides
++from media_culler.scoring.scene import classify_scene
+ from media_culler.scoring.subject import score_subject
+ from media_culler.scoring.technical import score_technical
+ 
+@@ -31,11 +33,30 @@ def combine(
+ 
+ def score_record(record: ImageRecord, settings: Settings) -> Scores:
+     scores = Scores()
++
++    scene_type, scene_reason = classify_scene(record, settings.scene)
++    scores.scene_type = scene_type
++    scores.details["scene"] = {"type": scene_type.value, "reason": scene_reason}
++    landscape = scene_type is SceneType.LANDSCAPE
++
+     if record.technical is not None:
+-        scores.technical, scores.details["technical"] = score_technical(record.technical)
++        overrides: dict[str, float] = {}
++        if landscape and record.scene is not None:
++            overrides, info = technical_overrides(record.technical, record.scene)
++            scores.details["scene"].update(info)
++        scores.technical, scores.details["technical"] = score_technical(record.technical, overrides)
+     if record.ai is not None:
+         scores.ai, scores.details["ai"] = score_ai(record.ai)
+-    if record.faces is not None:
++
++    if landscape:
++        # No faces to judge: "subject" does not apply, so it is excluded from the weighted
++        # mean (not scored as a neutral 50) and composition is judged on landscape rules.
++        if record.scene is not None:
++            scores.composition, composition_details = score_landscape_composition(
++                record.scene, settings.scene
++            )
++            scores.details["composition"] = composition_details
++    elif record.faces is not None:
+         scores.subject, scores.details["subject"] = score_subject(record.faces)
+         scores.composition, scores.details["composition"] = score_composition(
+             record.faces, record.width, record.height
+diff --git a/src/media_culler/scoring/landscape.py b/src/media_culler/scoring/landscape.py
+new file mode 100644
+index 0000000..8051f44
+--- /dev/null
++++ b/src/media_culler/scoring/landscape.py
+@@ -0,0 +1,89 @@
++"""Landscape-specific scoring: horizon, tone and focus rules that suit scenery.
++
++Faces drive subject/composition for portraits; landscapes need different questions:
++is the horizon level and sensibly placed, are skies blown out, is anything actually in
++focus (rather than "is the whole frame busy").
++"""
++
++from __future__ import annotations
++
++from media_culler.config import SceneConfig
++from media_culler.models import SceneMetrics, TechnicalMetrics
++from media_culler.scoring._math import clamp, ramp
++from media_culler.scoring.composition import rule_of_thirds_score
++from media_culler.scoring.technical import sharpness_score
++
++
++def horizon_level_score(tilt_deg: float) -> float:
++    """100 when level, falling to ~45 at 3 degrees and ~10 at 8+ degrees."""
++    tilt = abs(tilt_deg)
++    if tilt <= 0.3:
++        return 100.0
++    if tilt <= 3.0:
++        return ramp(tilt, 0.3, 3.0, 100, 45)
++    return ramp(tilt, 3.0, 8.0, 45, 10)
++
++
++def horizon_placement_score(y: float) -> float:
++    """Favour the thirds lines; a centred horizon is acceptable, one hugging an edge is not."""
++    distance = min(abs(y - 1 / 3), abs(y - 2 / 3))
++    if distance <= 1 / 6:
++        return ramp(distance, 0, 1 / 6, 100, 70)
++    return ramp(distance, 1 / 6, 1 / 3, 70, 40)
++
++
++def exposure_score(scene: SceneMetrics, brightness: float) -> float:
++    """Clipping-based exposure. Mean brightness only matters at the extremes.
++
++    The portrait rule (mean luminance near 125) punishes sunsets, night scenes and
++    high-key snow. What actually ruins a landscape is blown sky or crushed shadows.
++    """
++    highlights = ramp(scene.highlight_clip, 0.005, 0.15, 0, 70)
++    shadows = ramp(scene.shadow_clip, 0.02, 0.40, 0, 50)
++    extreme = max(ramp(brightness, 180, 235, 0, 40), ramp(35 - brightness, 0, 30, 0, 40))
++    return round(clamp(100 - highlights - shadows - extreme), 2)
++
++
++def dynamic_range_score(dynamic_range: float) -> float:
++    """Replaces global contrast: flat, hazy frames score low, full tonal range scores high."""
++    return ramp(dynamic_range, 50, 180, 25, 100)
++
++
++def technical_overrides(
++    technical: TechnicalMetrics, scene: SceneMetrics
++) -> tuple[dict[str, float], dict[str, object]]:
++    """Part-score overrides for score_technical plus what changed, for the report."""
++    focus = max(technical.sharpness, scene.sharpness_focus)
++    overrides = {
++        "sharpness": sharpness_score(focus),
++        "exposure": exposure_score(scene, technical.brightness),
++        "contrast": dynamic_range_score(scene.dynamic_range),
++    }
++    info: dict[str, object] = {
++        "sharpness_source": "tiled" if scene.sharpness_focus > technical.sharpness else "global",
++        "sharpness_used": round(focus, 2),
++    }
++    return overrides, info
++
++
++def score_landscape_composition(
++    scene: SceneMetrics, config: SceneConfig
++) -> tuple[float, dict[str, object]]:
++    parts: dict[str, tuple[float, float]] = {}  # name -> (score, weight)
++    details: dict[str, object] = {}
++
++    horizon = scene.horizon
++    if horizon is not None and horizon.confidence >= config.horizon_min_confidence:
++        parts["horizon_level"] = (horizon_level_score(horizon.angle_deg), 0.45)
++        parts["horizon_placement"] = (horizon_placement_score(horizon.y), 0.30)
++        details["horizon_tilt_deg"] = horizon.angle_deg
++        details["horizon_y"] = horizon.y
++    else:
++        details["horizon"] = "none detected"
++
++    parts["focal_point"] = (rule_of_thirds_score(scene.saliency_x, scene.saliency_y), 0.25)
++
++    total_weight = sum(weight for _, weight in parts.values())
++    score = sum(value * weight for value, weight in parts.values()) / total_weight
++    details["parts"] = {name: round(value, 2) for name, (value, _) in parts.items()}
++    return round(score, 2), details
+diff --git a/src/media_culler/scoring/scene.py b/src/media_culler/scoring/scene.py
+new file mode 100644
+index 0000000..36f5d50
+--- /dev/null
++++ b/src/media_culler/scoring/scene.py
+@@ -0,0 +1,33 @@
++"""Decide whether a photo should be judged as people, landscape or anything else."""
++
++from __future__ import annotations
++
++from media_culler.config import SceneConfig
++from media_culler.labels import LANDSCAPE_LABEL
++from media_culler.models import ImageRecord, SceneType
++
++
++def classify_scene(record: ImageRecord, config: SceneConfig) -> tuple[SceneType, str]:
++    """Returns (scene type, human-readable reason).
++
++    Faces only make a photo "people" when they are big enough to be the subject: a hiker
++    a kilometre away on a ridge does not turn a landscape into a portrait.
++    """
++    faces = record.faces.faces if record.faces else []
++    if any(face.area_ratio >= config.people_min_face_area for face in faces):
++        return SceneType.PEOPLE, "prominent face"
++
++    content = record.ai.content if record.ai else None
++    if (
++        content is not None
++        and content.label == LANDSCAPE_LABEL
++        and content.confidence >= config.landscape_min_confidence
++    ):
++        return SceneType.LANDSCAPE, "AI content label"
++
++    if config.heuristic_without_ai and record.ai is None and record.scene is not None:
++        horizon = record.scene.horizon
++        if horizon is not None and horizon.confidence >= config.heuristic_horizon_confidence:
++            return SceneType.LANDSCAPE, "strong horizon (no AI label available)"
++
++    return SceneType.GENERAL, "default"
+diff --git a/src/media_culler/scoring/technical.py b/src/media_culler/scoring/technical.py
+index 94c55da..81496bc 100644
+--- a/src/media_culler/scoring/technical.py
++++ b/src/media_culler/scoring/technical.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from collections.abc import Mapping
++
+ from media_culler.models import TechnicalMetrics
+ from media_culler.scoring._math import clamp, ramp
+ 
+@@ -20,13 +22,20 @@ def resolution_score(megapixels: float) -> float:
+     return ramp(megapixels, 2, 12, 20, 100)
+ 
+ 
+-def score_technical(metrics: TechnicalMetrics) -> tuple[float, dict[str, float]]:
++def score_technical(
++    metrics: TechnicalMetrics, overrides: Mapping[str, float] | None = None
++) -> tuple[float, dict[str, float]]:
++    """Weighted technical score. ``overrides`` replaces individual part scores (0-100),
++    which is how scene-aware scoring swaps in better sharpness/exposure/contrast measures.
++    """
+     parts = {
+         "sharpness": sharpness_score(metrics.sharpness),
+         "exposure": exposure_score(metrics.brightness),
+         "contrast": contrast_score(metrics.contrast),
+         "resolution": resolution_score(metrics.megapixels),
+     }
++    if overrides:
++        parts.update(overrides)
+     total = (
+         parts["sharpness"] * 0.40
+         + parts["exposure"] * 0.25
+diff --git a/src/media_culler/ui/render.py b/src/media_culler/ui/render.py
+index 6c56dde..38409b1 100644
+--- a/src/media_culler/ui/render.py
++++ b/src/media_culler/ui/render.py
+@@ -163,6 +163,9 @@ def print_results(
+             table = top_table(report)
+             if table:
+                 console.print(table)
++    if report.summary.scene_counts:
++        mix = " · ".join(f"{n} {name}" for name, n in report.summary.scene_counts.items())
++        console.print(f"[muted]scenes: {mix}[/]")
+     notes = notes_panel(report)
+     if notes:
+         console.print(notes)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 885ae77..d1a1641 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -52,3 +52,35 @@ def photo_dir(tmp_path: Path) -> Path:
+     (root / "corrupt.jpg").write_bytes(b"\xff\xd8\xff\xe0 definitely not a jpeg")
+     (root / "notes.txt").write_text("not an image")
+     return root
++
++
++def landscape_image(
++    width: int = 1200,
++    height: int = 800,
++    horizon: float = 0.4,
++    tilt: float = 0.0,
++    seed: int = 0,
++    detail: int = 8,
++) -> np.ndarray:
++    """Synthetic scenery: smooth gradient sky over textured ground, optionally rotated.
++
++    ``detail`` is the ground texture cell size in pixels (2 = fine, genuinely sharp detail).
++    ``tilt`` follows cv2.getRotationMatrix2D (positive = counter-clockwise), so a positive
++    tilt here is detected as a *negative* horizon angle (right side higher).
++    """
++    rng = np.random.default_rng(seed)
++    rows = np.linspace(0, 1, height)[:, None]
++    sky = np.stack([120 + 80 * rows, 170 + 50 * rows, 235 - 10 * rows], -1) * np.ones((1, width, 1))
++    ground = cv2.resize(
++        rng.integers(20, 120, (height // detail, width // detail, 3), dtype=np.uint8),
++        (width, height),
++        interpolation=cv2.INTER_CUBIC,
++    )
++    ground = (ground * np.array([0.5, 1.0, 0.4])).astype(np.uint8)
++    image = sky.astype(np.uint8)
++    split = int(height * horizon)
++    image[split:] = ground[split:]
++    if tilt:
++        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), tilt, 1.0)
++        image = cv2.warpAffine(image, matrix, (width, height), borderMode=cv2.BORDER_REPLICATE)
++    return image
+diff --git a/tests/test_landscape.py b/tests/test_landscape.py
+new file mode 100644
+index 0000000..6d8c175
+--- /dev/null
++++ b/tests/test_landscape.py
+@@ -0,0 +1,383 @@
++import cv2
++import numpy as np
++import pytest
++
++from conftest import landscape_image, save, textured
++from media_culler.analyzers.scene import (
++    SceneAnalyzer,
++    detect_horizon,
++    saliency_centroid,
++    tiled_sharpness,
++)
++from media_culler.analyzers.technical import TechnicalAnalyzer
++from media_culler.analyzers.vision import VisionAnalyzer
++from media_culler.config import SceneConfig, Settings
++from media_culler.imaging import ImageContext
++from media_culler.labels import LANDSCAPE_LABEL
++from media_culler.models import (
++    AIAssessment,
++    EyeMetrics,
++    FaceAnalysis,
++    FaceInfo,
++    HorizonInfo,
++    ImageRecord,
++    LabelPrediction,
++    PoseMetrics,
++    SceneMetrics,
++    SceneType,
++    TechnicalMetrics,
++)
++from media_culler.pipeline import Pipeline
++from media_culler.scoring import landscape as ls
++from media_culler.scoring import score_record
++from media_culler.scoring.scene import classify_scene
++from media_culler.scoring.technical import score_technical
++from test_analyzers import FakeVision
++
++
++def gray(image):
++    return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
++
++
++# ------------------------------------------------------------------ horizon detection
++@pytest.mark.parametrize("horizon", [0.33, 0.5, 0.67])
++@pytest.mark.parametrize("tilt", [0.0, 1.0, -2.5, 6.0])
++def test_horizon_tilt_and_position_are_recovered(horizon, tilt):
++    found = detect_horizon(gray(landscape_image(horizon=horizon, tilt=tilt)))
++    assert found is not None and found.confidence > 0.4
++    assert found.angle_deg == pytest.approx(-tilt, abs=0.35)  # cv2 CCW-positive vs ours CW-positive
++    assert found.y == pytest.approx(horizon, abs=0.03)
++
++
++def test_tilt_sign_convention_right_side_lower_is_positive():
++    found = detect_horizon(gray(landscape_image(tilt=-3.0)))  # clockwise: right side drops
++    assert found is not None and found.angle_deg > 2.5
++
++
++def smooth_noise(seed=3, size=(800, 1200)):
++    noise = np.random.default_rng(seed).normal(128, 40, (*size, 3)).astype(np.float32)
++    return np.clip(cv2.GaussianBlur(noise, (0, 0), 3), 0, 255).astype(np.uint8)
++
++
++@pytest.mark.parametrize(
++    "image",
++    [
++        np.zeros((800, 1200, 3), np.uint8),
++        np.tile((np.arange(1200) // 100 % 2 * 200).astype(np.uint8)[None, :, None], (800, 1, 3)),
++        cv2.circle(np.full((800, 1200, 3), 90, np.uint8), (600, 400), 150, (230, 200, 180), -1),
++        smooth_noise(),
++    ],
++    ids=["black", "vertical-bars", "centered-blob", "texture"],
++)
++def test_non_landscapes_do_not_yield_a_confident_horizon(image):
++    found = detect_horizon(gray(image))
++    assert found is None or found.confidence < SceneConfig().heuristic_horizon_confidence
++
++
++def test_steeply_slanted_lines_are_not_horizons():
++    assert detect_horizon(gray(landscape_image(tilt=25.0))) is None
++
++
++# --------------------------------------------------------------------- other metrics
++def test_tiled_sharpness_ignores_smooth_regions_but_not_blur():
++    rng = np.random.default_rng(0)
++    half = np.full((800, 1200), 128, np.uint8)
++    half[400:] = rng.integers(0, 255, (400, 1200), dtype=np.uint8)  # detail only in lower half
++    global_variance = float(cv2.Laplacian(half, cv2.CV_64F).var())
++    assert tiled_sharpness(half) > 1.6 * global_variance
++
++    blurred = cv2.GaussianBlur(half, (0, 0), 6)
++    assert tiled_sharpness(blurred) < 0.02 * tiled_sharpness(half)  # blur is soft in every tile
++
++
++def test_tiled_sharpness_handles_tiny_images():
++    assert tiled_sharpness(np.zeros((10, 10), np.uint8)) == 0.0
++
++
++def test_clipping_and_dynamic_range():
++    image = np.full((400, 600, 3), 100, np.uint8)
++    image[:100] = 255  # 25% blown
++    image[300:] = 0  # 25% crushed
++    m = SceneAnalyzer().analyze(ImageContext(None, image))  # type: ignore[arg-type]
++    assert m.highlight_clip == pytest.approx(0.25, abs=0.01)
++    assert m.shadow_clip == pytest.approx(0.25, abs=0.01)
++    assert m.dynamic_range > 240
++
++
++def test_saliency_finds_an_off_centre_subject():
++    image = np.full((600, 900, 3), 110, np.uint8)
++    cv2.circle(image, (700, 200), 60, (250, 250, 250), -1)
++    x, y = saliency_centroid(gray(image))
++    assert x > 0.6 and y < 0.4
++
++
++# ----------------------------------------------------------------------- scoring rules
++def scene(**kw) -> SceneMetrics:
++    base = dict(
++        horizon=HorizonInfo(angle_deg=0.0, y=1 / 3, confidence=0.9),
++        highlight_clip=0.0,
++        shadow_clip=0.0,
++        dynamic_range=200.0,
++        sharpness_focus=400.0,
++        saliency_x=1 / 3,
++        saliency_y=1 / 3,
++    )
++    base.update(kw)
++    return SceneMetrics(**base)
++
++
++def test_level_horizon_beats_tilted_symmetrically():
++    scores = [ls.horizon_level_score(t) for t in (0, 0.3, 1, 3, 6, 12)]
++    assert scores[0] == scores[1] == 100
++    assert scores == sorted(scores, reverse=True) and scores[-1] == 10
++    assert ls.horizon_level_score(-2) == ls.horizon_level_score(2)
++
++
++def test_horizon_placement_prefers_thirds_over_centre_over_edge():
++    third, centre, edge = (ls.horizon_placement_score(y) for y in (1 / 3, 0.5, 0.03))
++    assert third == 100 and 60 < centre < 80 and edge < 50 and edge < centre
++
++
++def test_exposure_is_clipping_based_not_mean_brightness():
++    sunset = ls.exposure_score(scene(), brightness=60)  # dark but nothing clipped
++    assert sunset >= 95
++    from media_culler.scoring.technical import exposure_score as portrait_rule
++
++    assert portrait_rule(60) < 60  # what the generic rule would have said
++    assert ls.exposure_score(scene(highlight_clip=0.2), 130) < 40  # blown sky
++    assert ls.exposure_score(scene(shadow_clip=0.5), 130) < 60
++    assert ls.exposure_score(scene(), 250) < 70  # absurdly bright overall
++
++
++def test_dynamic_range_flat_vs_full():
++    assert ls.dynamic_range_score(40) == 25 and ls.dynamic_range_score(200) == 100
++
++
++def test_tiled_sharpness_rescues_a_crisp_landscape_with_empty_sky():
++    technical = TechnicalMetrics(
++        sharpness=40, brightness=125, contrast=60, megapixels=12, perceptual_hash="0" * 16
++    )
++    generic, _ = score_technical(technical)
++    overrides, info = ls.technical_overrides(technical, scene(sharpness_focus=450))
++    landscape, parts = score_technical(technical, overrides)
++    assert landscape > generic + 15 and info["sharpness_source"] == "tiled"
++    assert parts["sharpness"] > 85
++
++
++def test_tiled_sharpness_never_lowers_a_score():
++    technical = TechnicalMetrics(
++        sharpness=300, brightness=125, contrast=60, megapixels=12, perceptual_hash="0" * 16
++    )
++    _, info = ls.technical_overrides(technical, scene(sharpness_focus=100))
++    assert info["sharpness_source"] == "global" and info["sharpness_used"] == 300
++
++
++def test_composition_without_a_confident_horizon_uses_focal_point_only():
++    weak = scene(horizon=HorizonInfo(angle_deg=9, y=0.5, confidence=0.1))
++    score, details = ls.score_landscape_composition(weak, SceneConfig())
++    assert set(details["parts"]) == {"focal_point"} and details["horizon"] == "none detected"
++    assert score == details["parts"]["focal_point"]
++
++
++def test_composition_penalises_a_tilted_horizon():
++    config = SceneConfig()
++    level, _ = ls.score_landscape_composition(scene(), config)
++    tilted, details = ls.score_landscape_composition(
++        scene(horizon=HorizonInfo(angle_deg=4.0, y=1 / 3, confidence=0.9)), config
++    )
++    assert tilted < level - 15 and details["horizon_tilt_deg"] == 4.0
++
++
++# ------------------------------------------------------------------ scene classification
++def face(area: float) -> FaceInfo:
++    return FaceInfo(
++        x=10,
++        y=10,
++        width=50,
++        height=50,
++        area_ratio=area,
++        sharpness=300,
++        eyes=EyeMetrics(left=0.3, right=0.3, average=0.3),
++        pose=PoseMetrics(symmetry=1.0, orientation="frontal"),
++    )
++
++
++def pred(label: str, confidence: float = 60.0) -> LabelPrediction:
++    return LabelPrediction(label=label, confidence=confidence, scores={label: confidence / 100})
++
++
++def ai(content: str, confidence: float = 60.0) -> AIAssessment:
++    other = pred("a professional photograph")
++    return AIAssessment(
++        content=pred(content, confidence),
++        photographic_quality=other,
++        composition=pred("a well composed photograph"),
++        aesthetic=pred("a visually striking photograph"),
++    )
++
++
++def record(**kw) -> ImageRecord:
++    base = dict(
++        path="/x/a.jpg",
++        relative_path="a.jpg",
++        filename="a.jpg",
++        extension=".jpg",
++        width=1200,
++        height=800,
++        technical=TechnicalMetrics(
++            sharpness=300, brightness=125, contrast=60, megapixels=1, perceptual_hash="0" * 16
++        ),
++    )
++    base.update(kw)
++    return ImageRecord(**base)
++
++
++def test_classification_rules():
++    cfg = SceneConfig()
++    landscape_ai = ai(LANDSCAPE_LABEL)
++    assert classify_scene(record(ai=landscape_ai), cfg)[0] is SceneType.LANDSCAPE
++    assert classify_scene(record(ai=ai("a food photograph")), cfg)[0] is SceneType.GENERAL
++    # a distant hiker does not make a landscape a portrait...
++    tiny = FaceAnalysis(face_count=1, faces=[face(0.0008)])
++    assert classify_scene(record(ai=landscape_ai, faces=tiny), cfg)[0] is SceneType.LANDSCAPE
++    # ...but a real face does, whatever the AI says
++    big = FaceAnalysis(face_count=1, faces=[face(0.05)])
++    assert classify_scene(record(ai=landscape_ai, faces=big), cfg)[0] is SceneType.PEOPLE
++
++
++def test_landscape_min_confidence_is_respected():
++    cfg = SceneConfig(landscape_min_confidence=40)
++    assert classify_scene(record(ai=ai(LANDSCAPE_LABEL, 10)), cfg)[0] is SceneType.GENERAL
++
++
++def test_heuristic_only_applies_without_ai_and_with_a_strong_horizon():
++    strong = scene(horizon=HorizonInfo(angle_deg=0, y=0.4, confidence=0.9))
++    weak = scene(horizon=HorizonInfo(angle_deg=0, y=0.4, confidence=0.4))
++    cfg = SceneConfig()
++    assert classify_scene(record(scene=strong), cfg)[0] is SceneType.LANDSCAPE
++    assert classify_scene(record(scene=weak), cfg)[0] is SceneType.GENERAL
++    # AI ran and said "food": a horizon line must not override it
++    assert classify_scene(record(scene=strong, ai=ai("a food photograph")), cfg)[0] is (
++        SceneType.GENERAL
++    )
++    assert classify_scene(record(scene=strong), SceneConfig(heuristic_without_ai=False))[0] is (
++        SceneType.GENERAL
++    )
++
++
++# ------------------------------------------------------------------- record-level scoring
++def test_landscape_records_exclude_subject_instead_of_scoring_a_neutral_50():
++    tiny_faces = FaceAnalysis(face_count=1, faces=[face(0.0008)])
++    rec = record(ai=ai(LANDSCAPE_LABEL), scene=scene(), faces=tiny_faces)
++    s = score_record(rec, Settings())
++    assert s.scene_type is SceneType.LANDSCAPE
++    assert s.subject is None and "subject" not in s.weights_used
++    assert set(s.weights_used) == {"technical", "ai", "composition"}
++    assert s.composition is not None and s.composition > 90  # level, thirds, focal point
++
++
++def test_non_landscape_scoring_is_unchanged():
++    rec = record(ai=ai("a food photograph"), faces=FaceAnalysis(face_count=0))
++    s = score_record(rec, Settings())
++    assert s.scene_type is SceneType.GENERAL
++    assert s.subject == 50.0 and s.composition == 50.0  # legacy neutral behaviour kept
++
++
++def test_landscape_without_scene_metrics_degrades_gracefully():
++    s = score_record(record(ai=ai(LANDSCAPE_LABEL)), Settings())
++    assert s.scene_type is SceneType.LANDSCAPE and s.composition is None
++    assert s.final is not None and set(s.weights_used) == {"technical", "ai"}
++
++
++# ------------------------------------------------------------------------- end to end
++def landscape_stack(settings, vision):
++    return [
++        TechnicalAnalyzer(),
++        SceneAnalyzer(),
++        VisionAnalyzer(settings.vision, backend=vision),
++    ]
++
++
++def test_level_landscape_outscores_tilted_one_end_to_end(settings, tmp_path):
++    root = tmp_path / "in"
++    save(landscape_image(horizon=0.4, seed=5), root / "level.jpg", quality=95)
++    save(landscape_image(horizon=0.4, tilt=4.0, seed=5), root / "tilted.jpg", quality=95)
++    result = Pipeline(
++        settings, analyzers=landscape_stack(settings, FakeVision({LANDSCAPE_LABEL: 0.9}))
++    ).run(root)
++    by = {r.filename: r for r in result.records}
++    assert {r.scores.scene_type for r in by.values()} == {SceneType.LANDSCAPE}
++    assert by["level.jpg"].scores.composition > by["tilted.jpg"].scores.composition + 20
++    assert by["level.jpg"].scores.final > by["tilted.jpg"].scores.final
++    assert by["tilted.jpg"].scores.details["composition"]["horizon_tilt_deg"] == pytest.approx(
++        -4.0, abs=0.5
++    )
++
++
++def test_scene_results_are_cached(settings, tmp_path):
++    root = tmp_path / "in"
++    save(landscape_image(seed=1), root / "a.jpg")
++    first = Pipeline(settings, analyzers=landscape_stack(settings, FakeVision())).run(root)
++    again = Pipeline(settings, analyzers=landscape_stack(settings, FakeVision())).run(root)
++    assert first.cache_hits == 0 and again.cache_misses == 0
++    assert again.records[0].scene == first.records[0].scene
++
++
++def test_default_stack_includes_scene_and_can_be_disabled(settings, tmp_path):
++    from media_culler.analyzers import build_analyzers
++
++    assert "scene" in {a.name for a in build_analyzers(settings)}
++    settings.scene.enabled = False
++    assert "scene" not in {a.name for a in build_analyzers(settings)}
++
++
++def test_plain_texture_photos_are_not_mistaken_for_landscapes(settings, tmp_path):
++    root = tmp_path / "in"
++    save(textured(1), root / "texture.jpg")
++    result = Pipeline(settings).run(root)
++    assert result.records[0].scores.scene_type is SceneType.GENERAL
++
++
++# ------------------------------------------------------------------- soft-focus gate
++def blurred_landscape_pair(tmp_path):
++    root = tmp_path / "in"
++    sharp = landscape_image(horizon=0.4, seed=4, detail=2)
++    save(sharp, root / "sharp.jpg", quality=95)
++    save(cv2.GaussianBlur(sharp, (0, 0), 6), root / "blurred.jpg", quality=95)
++    return root
++
++
++def test_blurred_landscape_cannot_be_rescued_by_good_composition(settings, tmp_path):
++    """Regression guard: landscape composition rewards a level horizon, so without the
++    gate a totally out-of-focus frame was promoted from review to usable."""
++    from media_culler.models import Recommendation
++
++    root = blurred_landscape_pair(tmp_path)
++    result = Pipeline(
++        settings, analyzers=landscape_stack(settings, FakeVision({LANDSCAPE_LABEL: 0.9}))
++    ).run(root)
++    by = {r.filename: r for r in result.records}
++    assert by["sharp.jpg"].recommendation in {Recommendation.SELECT, Recommendation.USABLE}
++    assert by["blurred.jpg"].recommendation is Recommendation.REVIEW
++    assert "soft" in by["blurred.jpg"].recommendation_reason.lower()
++    assert by["sharp.jpg"].scores.final > by["blurred.jpg"].scores.final + 10
++
++
++def test_soft_focus_gate_is_landscape_only_and_configurable(settings, tmp_path):
++    from media_culler.config import ThresholdsConfig
++    from media_culler.curation import classify
++    from media_culler.models import Recommendation
++
++    root = blurred_landscape_pair(tmp_path)
++    landscape = Pipeline(
++        settings, analyzers=landscape_stack(settings, FakeVision({LANDSCAPE_LABEL: 0.9}))
++    ).run(root)
++    blurred = next(r for r in landscape.records if r.filename == "blurred.jpg")
++    assert (
++        classify(blurred, ThresholdsConfig(soft_focus_sharpness=0))[0]
++        is not (Recommendation.REVIEW)
++        or blurred.scores.final < 65
++    )  # gate off: ordinary thresholds apply
++
++    blurred.scores.scene_type = SceneType.GENERAL  # same pixels, not a landscape
++    assert "soft" not in classify(blurred, ThresholdsConfig())[1].lower()
+-- 
+2.43.0
+
+
+From d8584d8361190e400ecdd196d6bd52f8573df0e5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 9 Oct 2026 18:55:26 +0000
+Subject: [PATCH 3/5] feat: group-photo subject detection and blink-aware
+ best-shot selection
+
+A group photo was scored by averaging every detected face, so a passer-by in the
+background could drag it down, while a subject with fully closed eyes still
+scored ~80 (the weighted sum barely penalised it). Best-shot choice used the final
+score alone, including the AI label, which flips between near-identical frames.
+
+- scoring/group.py: a face is a subject if it is at least selection.min_face_area
+  of the frame AND selection.relative_face_area of the largest face, so passers-by
+  are ignored but a distant group is still a group. Eyes are only judged on faces
+  big enough to read and not in profile (better to miss a blink than invent one)
+- Closed eyes cap that face (45) and the whole subject score (60); subject and
+  composition are computed on subjects only, so a cropped bystander no longer
+  hurts composition
+- Scores.selection: final score without the AI component. Frames of one scene
+  share content, so selection compares them on technical/subject/composition
+- select_best_shots: within selection.margin points of the best frame, the one
+  with fewest problems wins (closed eyes, or a subject missing vs the group's
+  median face count so one false detection cannot skew it); outside the margin
+  quality wins, so nobody keeps a blurry frame just for open eyes. Reasons explain
+  why each frame was kept or dropped
+- thresholds.closed_eyes_gate caps photos with a closed-eyed subject at 'review'
+- Report: CSV subjects/closed_eyes columns, summary.closed_eyes_photos
+
+Changed existing test: test_two_faces_weight_the_weaker_one used an eye ratio of
+0.10, which now counts as closed and is capped; it now uses 0.16 (a squint) to keep
+testing the 40/60 weighting.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ src/media_culler/config.py          |  34 ++++
+ src/media_culler/curation.py        |  93 +++++++--
+ src/media_culler/models.py          |  16 ++
+ src/media_culler/pipeline.py        |   2 +-
+ src/media_culler/reporting.py       |   8 +
+ src/media_culler/scoring/final.py   |  19 +-
+ src/media_culler/scoring/group.py   |  42 ++++
+ src/media_culler/scoring/subject.py |  40 +++-
+ src/media_culler/ui/render.py       |   5 +
+ tests/test_groups.py                | 299 ++++++++++++++++++++++++++++
+ tests/test_scoring.py               |   2 +-
+ 11 files changed, 537 insertions(+), 23 deletions(-)
+ create mode 100644 src/media_culler/scoring/group.py
+ create mode 100644 tests/test_groups.py
+
+diff --git a/src/media_culler/config.py b/src/media_culler/config.py
+index 5408738..419d0e6 100644
+--- a/src/media_culler/config.py
++++ b/src/media_culler/config.py
+@@ -84,6 +84,9 @@ class ThresholdsConfig(_Section):
+     # Landscapes whose sharpness sub-score (0-100) is below this are capped at "review", however
+     # well composed: a level horizon must not rescue an out-of-focus frame. 0 disables the gate.
+     soft_focus_sharpness: float = Field(12, ge=0, le=100)
++    # Photos where a subject's eyes are clearly closed are capped at "review" (a person can
++    # decide; a blink is sometimes intended). Disable with false.
++    closed_eyes_gate: bool = True
+ 
+     @model_validator(mode="after")
+     def _ordered(self) -> ThresholdsConfig:
+@@ -153,6 +156,26 @@ class SceneConfig(_Section):
+     heuristic_horizon_confidence: float = Field(0.6, ge=0, le=1)
+ 
+ 
++class SelectionConfig(_Section):
++    """Who counts as a subject, when eyes count as closed, and how best shots are chosen."""
++
++    # A face is a subject if it covers at least this fraction of the frame...
++    min_face_area: float = Field(0.002, ge=0, le=1)
++    # ...and at least this fraction of the LARGEST face (so passers-by are ignored but a
++    # whole group photographed from far away is still a group).
++    relative_face_area: float = Field(0.12, ge=0, le=1)
++    # Eyes are judged only on faces at least this large; landmarks on tiny faces are too noisy.
++    blink_min_face_area: float = Field(0.004, ge=0, le=1)
++    # Eye-aspect-ratio below this means "closed" (open eyes are typically 0.22-0.35).
++    closed_ear_threshold: float = Field(0.14, ge=0, le=1)
++    # A face with closed eyes cannot score above this; one closed face caps the whole subject.
++    closed_face_cap: float = Field(45, ge=0, le=100)
++    closed_subject_cap: float = Field(60, ge=0, le=100)
++    # Among similar frames, only those within this many points of the best may win on
++    # "nobody blinked", so a sharp frame is never beaten by a blurry one just for open eyes.
++    margin: float = Field(12, ge=0, le=100)
++
++
+ class PerformanceConfig(_Section):
+     # Worker threads for scanning/hashing and for decode + OpenCV analysis prefetch.
+     workers: int = Field(4, ge=1, le=64)
+@@ -168,6 +191,7 @@ class Settings(_Section):
+     vision: VisionConfig = VisionConfig()
+     faces: FacesConfig = FacesConfig()
+     scene: SceneConfig = SceneConfig()
++    selection: SelectionConfig = SelectionConfig()
+     performance: PerformanceConfig = PerformanceConfig()
+ 
+     @property
+@@ -289,6 +313,7 @@ thresholds:                         # final score (0-100) cut-offs
+   review: 45
+   technical_floor: 25               # below this technical score => always reject_candidate
+   soft_focus_sharpness: 12          # landscapes softer than this sub-score are capped at review
++  closed_eyes_gate: true            # photos with a subject's eyes closed are capped at review
+ 
+ weights:                            # relative; normalised over available components
+   technical: 0.40
+@@ -323,6 +348,15 @@ scene:                              # landscape-aware scoring
+   heuristic_without_ai: true        # guess "landscape" from a strong horizon when AI is off
+   heuristic_horizon_confidence: 0.6
+ 
++selection:                          # group photos and best-shot choice
++  min_face_area: 0.002              # smaller faces are never subjects
++  relative_face_area: 0.12          # ...nor faces much smaller than the largest one
++  blink_min_face_area: 0.004        # eyes are only judged on faces at least this large
++  closed_ear_threshold: 0.14        # eye-aspect-ratio below this = closed
++  closed_face_cap: 45               # max score of a face with closed eyes
++  closed_subject_cap: 60            # max subject score if any subject has closed eyes
++  margin: 12                        # open-eyes can only win within this many points of the best
++
+ performance:
+   workers: 4
+   use_cache: true
+diff --git a/src/media_culler/curation.py b/src/media_culler/curation.py
+index 8e3e6e9..14554de 100644
+--- a/src/media_culler/curation.py
++++ b/src/media_culler/curation.py
+@@ -2,7 +2,9 @@
+ 
+ from __future__ import annotations
+ 
+-from media_culler.config import ThresholdsConfig
++import statistics
++
++from media_culler.config import SelectionConfig, ThresholdsConfig
+ from media_culler.models import GroupRole, ImageRecord, Recommendation, SceneType
+ 
+ 
+@@ -37,6 +39,16 @@ def _soft_focus_landscape(record: ImageRecord, thresholds: ThresholdsConfig) ->
+     return sharpness is not None and sharpness < thresholds.soft_focus_sharpness
+ 
+ 
++def _closed_eyes(record: ImageRecord) -> int:
++    group = record.scores.group if record.scores else None
++    return len(group.closed_eyes) if group else 0
++
++
++def _significant_faces(record: ImageRecord) -> int:
++    group = record.scores.group if record.scores else None
++    return len(group.significant) if group else 0
++
++
+ def classify(record: ImageRecord, thresholds: ThresholdsConfig) -> tuple[Recommendation, str]:
+     final = record.final_score
+     technical = record.scores.technical if record.scores else None
+@@ -46,6 +58,10 @@ def classify(record: ImageRecord, thresholds: ThresholdsConfig) -> tuple[Recomme
+         return Recommendation.REJECT, "Very low technical quality"
+     if _soft_focus_landscape(record, thresholds) and final >= thresholds.review:
+         return Recommendation.REVIEW, "Landscape is soft/out of focus; check before keeping"
++    closed = _closed_eyes(record)
++    if thresholds.closed_eyes_gate and closed and final >= thresholds.review:
++        total = _significant_faces(record)
++        return Recommendation.REVIEW, f"Closed eyes on {closed} of {total} faces; check first"
+     if final >= thresholds.select:
+         return Recommendation.SELECT, "High overall photographic score"
+     if final >= thresholds.usable:
+@@ -61,7 +77,25 @@ def apply_recommendations(records: list[ImageRecord], thresholds: ThresholdsConf
+             record.recommendation, record.recommendation_reason = classify(record, thresholds)
+ 
+ 
+-def select_best_shots(records: list[ImageRecord]) -> None:
++def _selection_value(record: ImageRecord) -> float:
++    """Selection score, falling back to the final score for records that predate it."""
++    scores = record.scores
++    if scores is None:
++        return -1.0
++    if scores.selection is not None:
++        return scores.selection
++    return scores.final if scores.final is not None else -1.0
++
++
++def select_best_shots(records: list[ImageRecord], config: SelectionConfig | None = None) -> None:
++    """Pick one representative per similar-image group.
++
++    Frames are compared on their *selection* score (no AI component). Within ``margin`` points
++    of the best, the frame with the fewest problems wins, where a problem is a subject with
++    closed eyes or a subject that went missing (fewer faces than the group's typical frame).
++    Outside the margin, quality wins: nobody should keep a blurry frame just for open eyes.
++    """
++    config = config or SelectionConfig()
+     groups: dict[int, list[ImageRecord]] = {}
+     for record in records:
+         if record.status != "valid":
+@@ -73,15 +107,48 @@ def select_best_shots(records: list[ImageRecord]) -> None:
+             groups.setdefault(record.duplicate_group, []).append(record)
+ 
+     for members in groups.values():
+-        best = min(members, key=_sort_key)  # unscored (None -> 0.0) naturally sort last
+-        best_score = best.final_score
+-        for record in members:
+-            record.best_shot_score = best_score
+-            if record is best:
+-                record.group_role = GroupRole.REPRESENTATIVE
+-                record.is_group_representative = True
+-                record.selection_reason = "Highest final score in similar-image group"
++        _select_in_group(members, config)
++
++
++def _select_in_group(members: list[ImageRecord], config: SelectionConfig) -> None:
++    scored = [r for r in members if _selection_value(r) >= 0]
++    pool = scored or members
++
++    # The median (not max) face count, so one false detection can't make every other frame
++    # look like it lost a person.
++    typical = int(statistics.median_high([_significant_faces(r) for r in pool]))
++
++    def problems(record: ImageRecord) -> int:
++        return _closed_eyes(record) + max(0, typical - _significant_faces(record))
++
++    top = max(_selection_value(r) for r in pool)
++    contenders = [r for r in pool if _selection_value(r) >= top - config.margin]
++    best = min(contenders, key=lambda r: (problems(r), -_selection_value(r), r.path))
++    strongest = min(pool, key=lambda r: (-_selection_value(r), r.path))
++
++    for record in members:
++        record.best_shot_score = best.final_score
++        if record is best:
++            record.group_role = GroupRole.REPRESENTATIVE
++            record.is_group_representative = True
++            if best is not strongest and problems(best) < problems(strongest):
++                record.selection_reason = (
++                    "Chosen over a slightly higher-scoring frame because it has fewer "
++                    f"problems ({problems(best)} vs {problems(strongest)}): "
++                    "eyes open and everyone present"
++                )
+             else:
+-                record.group_role = GroupRole.SIMILAR
+-                record.is_group_representative = False
+-                record.selection_reason = "Lower final score than group representative"
++                record.selection_reason = "Highest selection score in similar-image group"
++        else:
++            record.group_role = GroupRole.SIMILAR
++            record.is_group_representative = False
++            record.selection_reason = _why_not(record, best, problems(record), problems(best))
++
++
++def _why_not(record: ImageRecord, best: ImageRecord, mine: int, theirs: int) -> str:
++    closed = _closed_eyes(record)
++    if closed and mine > theirs:
++        return f"Closed eyes on {closed} face(s); a better frame exists in this group"
++    if mine > theirs:
++        return "A subject is missing or turned away compared with the best frame"
++    return "Lower selection score than the group's best shot"
+diff --git a/src/media_culler/models.py b/src/media_culler/models.py
+index e3df81c..72fbe0e 100644
+--- a/src/media_culler/models.py
++++ b/src/media_culler/models.py
+@@ -105,6 +105,19 @@ class SceneMetrics(BaseModel):
+ # ------------------------------------------------------------------------- scores
+ 
+ 
++class GroupAssessment(BaseModel):
++    """Which detected faces count as the photo's subjects, and what state they are in.
++
++    Indices refer to ``FaceAnalysis.faces``. Background faces (passers-by, far-away crowd)
++    are neither scored nor allowed to veto a frame.
++    """
++
++    significant: list[int] = Field(default_factory=list)
++    closed_eyes: list[int] = Field(default_factory=list)  # subset of significant
++    looking_away: list[int] = Field(default_factory=list)  # subset of significant
++    ignored: int = 0  # detected faces judged to be background
++
++
+ class Scores(BaseModel):
+     technical: float | None = None
+     ai: float | None = None
+@@ -112,6 +125,9 @@ class Scores(BaseModel):
+     composition: float | None = None
+     final: float | None = None
+     scene_type: SceneType | None = None
++    # Final score without the AI component: what frames of one scene are compared on.
++    selection: float | None = None
++    group: GroupAssessment | None = None
+     # Normalised weights actually applied (components that were unavailable are absent).
+     weights_used: dict[str, float] = Field(default_factory=dict)
+     details: dict[str, Any] = Field(default_factory=dict)
+diff --git a/src/media_culler/pipeline.py b/src/media_culler/pipeline.py
+index c2eff32..77c128a 100644
+--- a/src/media_culler/pipeline.py
++++ b/src/media_culler/pipeline.py
+@@ -246,4 +246,4 @@ class Pipeline:
+                 record.scores = score_record(record, self.settings)
+         rank_collection(records)
+         apply_recommendations(records, self.settings.thresholds)
+-        select_best_shots(records)
++        select_best_shots(records, self.settings.selection)
+diff --git a/src/media_culler/reporting.py b/src/media_culler/reporting.py
+index 98fba02..3c46723 100644
+--- a/src/media_culler/reporting.py
++++ b/src/media_culler/reporting.py
+@@ -41,6 +41,7 @@ class Summary(BaseModel):
+     median_score: float | None
+     analyzer_failures: dict[str, int]
+     scene_counts: dict[str, int] = Field(default_factory=dict)
++    closed_eyes_photos: int = 0
+     top: list[TopImage]
+ 
+ 
+@@ -93,6 +94,9 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int
+         median_score=round(statistics.median(values), 2) if values else None,
+         analyzer_failures=failures,
+         scene_counts=dict(sorted(scenes.items())),
++        closed_eyes_photos=sum(
++            1 for r in valid if r.scores and r.scores.group and r.scores.group.closed_eyes
++        ),
+         top=[
+             TopImage(
+                 filename=r.filename,
+@@ -153,6 +157,8 @@ CSV_COLUMNS = [
+     "subject",
+     "composition",
+     "faces",
++    "subjects",
++    "closed_eyes",
+     "duplicate_group",
+     "group_role",
+     "width",
+@@ -178,6 +184,8 @@ def _csv_row(r: ImageRecord) -> dict[str, Any]:
+         "subject": s.subject if s else None,
+         "composition": s.composition if s else None,
+         "faces": r.faces.face_count if r.faces else None,
++        "subjects": len(s.group.significant) if s and s.group else None,
++        "closed_eyes": len(s.group.closed_eyes) if s and s.group else None,
+         "duplicate_group": r.duplicate_group,
+         "group_role": r.group_role.value if r.group_role else "",
+         "width": r.width,
+diff --git a/src/media_culler/scoring/final.py b/src/media_culler/scoring/final.py
+index 1ceefb9..65b233c 100644
+--- a/src/media_culler/scoring/final.py
++++ b/src/media_culler/scoring/final.py
+@@ -4,6 +4,7 @@ from media_culler.config import Settings, WeightsConfig
+ from media_culler.models import ImageRecord, SceneType, Scores
+ from media_culler.scoring.ai import score_ai
+ from media_culler.scoring.composition import score_composition
++from media_culler.scoring.group import assess_faces, subject_faces
+ from media_culler.scoring.landscape import score_landscape_composition, technical_overrides
+ from media_culler.scoring.scene import classify_scene
+ from media_culler.scoring.subject import score_subject
+@@ -57,9 +58,13 @@ def score_record(record: ImageRecord, settings: Settings) -> Scores:
+             )
+             scores.details["composition"] = composition_details
+     elif record.faces is not None:
+-        scores.subject, scores.details["subject"] = score_subject(record.faces)
++        assessment = assess_faces(record.faces, settings.selection)
++        scores.group = assessment
++        scores.subject, scores.details["subject"] = score_subject(
++            record.faces, settings.selection, assessment
++        )
+         scores.composition, scores.details["composition"] = score_composition(
+-            record.faces, record.width, record.height
++            subject_faces(record.faces, assessment), record.width, record.height
+         )
+ 
+     scores.final, scores.weights_used = combine(
+@@ -71,4 +76,14 @@ def score_record(record: ImageRecord, settings: Settings) -> Scores:
+         },
+         settings.weights,
+     )
++    # Frames of one scene share content, so the AI label (which flips between near-identical
++    # frames) is noise there. Selection compares them on what actually varies.
++    scores.selection, _ = combine(
++        {
++            "technical": scores.technical,
++            "subject": scores.subject,
++            "composition": scores.composition,
++        },
++        settings.weights,
++    )
+     return scores
+diff --git a/src/media_culler/scoring/group.py b/src/media_culler/scoring/group.py
+new file mode 100644
+index 0000000..45e3d2c
+--- /dev/null
++++ b/src/media_culler/scoring/group.py
+@@ -0,0 +1,42 @@
++"""Group-photo analysis: who is a subject, who is blinking, who is looking away.
++
++A group photo is only as good as its worst *subject*, but a passer-by 30 m behind the
++group must not count as one. Everything here is pure and driven by ``SelectionConfig``.
++"""
++
++from __future__ import annotations
++
++from media_culler.config import SelectionConfig
++from media_culler.models import FaceAnalysis, FaceInfo, GroupAssessment
++
++
++def eyes_closed(face: FaceInfo, config: SelectionConfig) -> bool:
++    """Clearly closed eyes. Unknown (-> False) when the face is too small or in profile,
++    where eye landmarks are unreliable: better to miss a blink than invent one."""
++    if face.area_ratio < config.blink_min_face_area:
++        return False
++    if face.pose.orientation == "strongly_turned":
++        return False
++    return face.eyes.average < config.closed_ear_threshold
++
++
++def assess_faces(analysis: FaceAnalysis, config: SelectionConfig) -> GroupAssessment:
++    faces = analysis.faces
++    if not faces:
++        return GroupAssessment()
++
++    largest = max(face.area_ratio for face in faces)
++    floor = max(config.min_face_area, config.relative_face_area * largest)
++    significant = [i for i, face in enumerate(faces) if face.area_ratio >= floor]
++    return GroupAssessment(
++        significant=significant,
++        closed_eyes=[i for i in significant if eyes_closed(faces[i], config)],
++        looking_away=[i for i in significant if faces[i].pose.orientation == "strongly_turned"],
++        ignored=len(faces) - len(significant),
++    )
++
++
++def subject_faces(analysis: FaceAnalysis, assessment: GroupAssessment) -> FaceAnalysis:
++    """The analysis restricted to subjects (for composition and subject scoring)."""
++    kept = [analysis.faces[i] for i in assessment.significant]
++    return FaceAnalysis(face_count=len(kept), faces=kept)
+diff --git a/src/media_culler/scoring/subject.py b/src/media_culler/scoring/subject.py
+index bc576d8..2d53ae8 100644
+--- a/src/media_culler/scoring/subject.py
++++ b/src/media_culler/scoring/subject.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
+-from media_culler.models import FaceAnalysis, FaceInfo
++from media_culler.config import SelectionConfig
++from media_culler.models import FaceAnalysis, FaceInfo, GroupAssessment
+ from media_culler.scoring._math import clamp, ramp
++from media_culler.scoring.group import assess_faces
+ 
+ NO_FACE_SCORE = 50.0  # neutral: absence of faces is not a defect
+ 
+@@ -25,11 +27,29 @@ def score_face(face: FaceInfo) -> dict[str, float]:
+     }
+ 
+ 
+-def score_subject(analysis: FaceAnalysis) -> tuple[float, dict[str, object]]:
+-    if not analysis.faces:
+-        return NO_FACE_SCORE, {"face_scores": [], "reason": "No detectable faces"}
++def score_subject(
++    analysis: FaceAnalysis,
++    config: SelectionConfig | None = None,
++    assessment: GroupAssessment | None = None,
++) -> tuple[float, dict[str, object]]:
++    config = config or SelectionConfig()
++    assessment = assessment or assess_faces(analysis, config)
+ 
+-    face_scores = [score_face(face)["face_score"] for face in analysis.faces]
++    if not assessment.significant:
++        reason = "Only distant/background faces" if analysis.faces else "No detectable faces"
++        return NO_FACE_SCORE, {
++            "face_scores": [],
++            "reason": reason,
++            "ignored_faces": len(analysis.faces),
++        }
++
++    face_scores: list[float] = []
++    for index in assessment.significant:
++        score = score_face(analysis.faces[index])["face_score"]
++        if index in assessment.closed_eyes:
++            # The weighted sum lets a face with shut eyes still score ~80: cap it explicitly.
++            score = min(score, config.closed_face_cap)
++        face_scores.append(score)
+     ordered = sorted(face_scores, reverse=True)
+ 
+     if len(ordered) == 1:
+@@ -41,4 +61,12 @@ def score_subject(analysis: FaceAnalysis) -> tuple[float, dict[str, object]]:
+         score = sum(ordered) / len(ordered) * 0.70 + ordered[-1] * 0.30
+         reason = "Group average with weakest-subject penalty"
+ 
+-    return round(score, 2), {"face_scores": face_scores, "reason": reason}
++    if assessment.closed_eyes:
++        score = min(score, config.closed_subject_cap)
++
++    return round(score, 2), {
++        "face_scores": face_scores,
++        "reason": reason,
++        "ignored_faces": assessment.ignored,
++        "closed_eyes": len(assessment.closed_eyes),
++    }
+diff --git a/src/media_culler/ui/render.py b/src/media_culler/ui/render.py
+index 38409b1..ffb4820 100644
+--- a/src/media_culler/ui/render.py
++++ b/src/media_culler/ui/render.py
+@@ -166,6 +166,11 @@ def print_results(
+     if report.summary.scene_counts:
+         mix = " · ".join(f"{n} {name}" for name, n in report.summary.scene_counts.items())
+         console.print(f"[muted]scenes: {mix}[/]")
++    if report.summary.closed_eyes_photos:
++        console.print(
++            f"[muted]closed eyes flagged in {report.summary.closed_eyes_photos} photo(s): "
++            "capped at review; the CSV 'closed_eyes' column lists them[/]"
++        )
+     notes = notes_panel(report)
+     if notes:
+         console.print(notes)
+diff --git a/tests/test_groups.py b/tests/test_groups.py
+new file mode 100644
+index 0000000..8380d6e
+--- /dev/null
++++ b/tests/test_groups.py
+@@ -0,0 +1,299 @@
++import cv2
++import numpy as np
++
++from conftest import save, textured
++from media_culler.analyzers import Analyzer
++from media_culler.analyzers.technical import TechnicalAnalyzer
++from media_culler.config import SelectionConfig, Settings, ThresholdsConfig
++from media_culler.curation import classify, select_best_shots
++from media_culler.models import (
++    EyeMetrics,
++    FaceAnalysis,
++    FaceInfo,
++    GroupAssessment,
++    GroupRole,
++    ImageRecord,
++    PoseMetrics,
++    Recommendation,
++    Scores,
++    TechnicalMetrics,
++)
++from media_culler.pipeline import Pipeline
++from media_culler.reporting import build_report
++from media_culler.scoring import score_record
++from media_culler.scoring.group import assess_faces, eyes_closed, subject_faces
++from media_culler.scoring.subject import score_subject
++
++CFG = SelectionConfig()
++OPEN, CLOSED = 0.30, 0.08
++
++
++def face(area=0.03, ear=OPEN, orientation="frontal", x=400, y=300) -> FaceInfo:
++    return FaceInfo(
++        x=x,
++        y=y,
++        width=120,
++        height=120,
++        area_ratio=area,
++        sharpness=400,
++        eyes=EyeMetrics(left=ear, right=ear, average=ear),
++        pose=PoseMetrics(
++            symmetry=1.0 if orientation == "frontal" else 0.3, orientation=orientation
++        ),
++    )
++
++
++def faces(*items: FaceInfo) -> FaceAnalysis:
++    return FaceAnalysis(face_count=len(items), faces=list(items))
++
++
++# ------------------------------------------------------------------ who is a subject
++def test_passer_by_is_not_a_subject():
++    a = assess_faces(faces(face(0.03), face(0.03), face(0.0009)), CFG)
++    assert a.significant == [0, 1] and a.ignored == 1
++
++
++def test_relative_rule_ignores_much_smaller_faces_but_keeps_a_distant_group():
++    mixed = assess_faces(faces(face(0.05), face(0.004)), CFG)  # 0.004 < 0.12 * 0.05
++    assert mixed.significant == [0]
++    far_group = assess_faces(faces(*[face(0.003) for _ in range(6)]), CFG)
++    assert len(far_group.significant) == 6  # all small, but they are the subjects
++
++
++def test_nobody_is_a_subject_when_every_face_is_tiny():
++    a = assess_faces(faces(face(0.0005), face(0.0008)), CFG)
++    assert a.significant == [] and a.ignored == 2
++
++
++def test_no_faces():
++    assert assess_faces(FaceAnalysis(face_count=0), CFG) == GroupAssessment()
++
++
++# --------------------------------------------------------------------- closed eyes
++def test_closed_eye_detection_and_its_limits():
++    assert eyes_closed(face(ear=CLOSED), CFG)
++    assert not eyes_closed(face(ear=OPEN), CFG)
++    assert not eyes_closed(face(ear=0.16), CFG)  # squint/laugh is not a blink
++    assert not eyes_closed(face(area=0.003, ear=CLOSED), CFG)  # too small to judge
++    assert not eyes_closed(face(ear=CLOSED, orientation="strongly_turned"), CFG)  # profile
++
++
++def test_looking_away_is_tracked_separately():
++    a = assess_faces(faces(face(), face(orientation="strongly_turned")), CFG)
++    assert a.looking_away == [1] and a.closed_eyes == []
++
++
++# ------------------------------------------------------------------ subject scoring
++def test_a_bystander_does_not_change_the_score():
++    group = [face(0.03), face(0.03), face(0.03)]
++    clean, _ = score_subject(faces(*group))
++    noisy, details = score_subject(faces(*group, face(0.0008, ear=CLOSED)))
++    assert noisy == clean and details["ignored_faces"] == 1
++
++
++def test_only_background_faces_is_neutral_with_a_clear_reason():
++    score, details = score_subject(faces(face(0.0005)))
++    assert score == 50.0 and "background" in details["reason"]
++
++
++def test_closed_eyes_are_capped_hard():
++    """Regression: the weighted sum let a face with shut eyes still score about 80."""
++    open_face, _ = score_subject(faces(face(0.05)))
++    blink, _ = score_subject(faces(face(0.05, ear=CLOSED)))
++    assert open_face > 90 and blink <= CFG.closed_face_cap
++
++
++def test_one_blinker_caps_the_whole_group():
++    four = [face(0.05) for _ in range(3)] + [face(0.05, ear=CLOSED)]
++    score, details = score_subject(faces(*four))
++    assert score <= CFG.closed_subject_cap and details["closed_eyes"] == 1
++    assert score_subject(faces(*four[:3]))[0] > 90
++
++
++def test_composition_ignores_a_cropped_bystander_on_the_frame_edge():
++    from test_landscape import record
++
++    centred = [face(0.03, x=450, y=350)]
++    edge_bystander = face(0.0008, x=0, y=0)  # clipped by the corner
++    base = score_record(record(faces=faces(*centred)), Settings())
++    with_extra = score_record(record(faces=faces(*centred, edge_bystander)), Settings())
++    assert with_extra.composition == base.composition
++    assert subject_faces(faces(*centred, edge_bystander), with_extra.group).face_count == 1
++
++
++# --------------------------------------------------------------------- best-shot rule
++def frame(
++    name, selection, *, subjects=3, closed=0, final=None, group=1, sharp=300.0
++) -> ImageRecord:
++    r = ImageRecord(
++        path=f"/p/{name}",
++        relative_path=name,
++        filename=name,
++        extension=".jpg",
++        duplicate_group=group,
++    )
++    r.technical = TechnicalMetrics(
++        sharpness=sharp, brightness=125, contrast=60, megapixels=12, perceptual_hash="0" * 16
++    )
++    r.scores = Scores(
++        technical=80,
++        final=selection if final is None else final,
++        selection=selection,
++        group=GroupAssessment(significant=list(range(subjects)), closed_eyes=list(range(closed))),
++    )
++    return r
++
++
++def roles(records):
++    return {r.filename: r.group_role for r in records}
++
++
++def test_open_eyes_win_within_the_margin():
++    blink, open_eyes = frame("a", 86, closed=1), frame("b", 80)
++    select_best_shots([blink, open_eyes], CFG)
++    assert roles([blink, open_eyes]) == {
++        "a": GroupRole.SIMILAR,
++        "b": GroupRole.REPRESENTATIVE,
++    }
++    assert "fewer problems" in open_eyes.selection_reason
++    assert "Closed eyes on 1" in blink.selection_reason
++
++
++def test_quality_wins_outside_the_margin():
++    sharp_blink, blurry_open = frame("a", 86, closed=1), frame("b", 60)  # 26 points worse
++    select_best_shots([sharp_blink, blurry_open], CFG)
++    assert sharp_blink.group_role is GroupRole.REPRESENTATIVE
++    assert blurry_open.selection_reason == "Lower selection score than the group's best shot"
++
++
++def test_margin_is_configurable():
++    a, b = frame("a", 86, closed=1), frame("b", 80)
++    select_best_shots([a, b], SelectionConfig(margin=3))
++    assert a.group_role is GroupRole.REPRESENTATIVE
++
++
++def test_without_problems_the_highest_score_wins_and_ties_break_by_path():
++    a, b, c = frame("b", 80), frame("a", 80), frame("c", 79)
++    select_best_shots([a, b, c], CFG)
++    assert b.group_role is GroupRole.REPRESENTATIVE  # path 'a' beats 'b' on a tie
++    assert a.selection_reason == "Lower selection score than the group's best shot"
++
++
++def test_a_missing_subject_counts_as_a_problem():
++    full, missing = frame("a", 82, subjects=4), frame("b", 85, subjects=3)
++    third, fourth = frame("c", 70, subjects=4), frame("d", 70, subjects=4)
++    select_best_shots([full, missing, third, fourth], CFG)
++    assert full.group_role is GroupRole.REPRESENTATIVE
++    assert "missing" in missing.selection_reason
++
++
++def test_one_false_detection_does_not_make_every_other_frame_look_short():
++    ghost = frame("a", 85, subjects=5)  # a false positive adds a 5th face
++    honest = [frame("b", 84, subjects=4), frame("c", 80, subjects=4), frame("d", 80, subjects=4)]
++    select_best_shots([ghost, *honest], CFG)
++    assert ghost.group_role is GroupRole.REPRESENTATIVE  # highest score; nobody penalised
++
++
++def test_unscored_frames_never_win_and_all_unscored_still_picks_one():
++    scored = frame("b", 50)
++    unscored = ImageRecord(
++        path="/p/a", relative_path="a", filename="a", extension=".jpg", duplicate_group=1
++    )
++    select_best_shots([unscored, scored], CFG)
++    assert scored.group_role is GroupRole.REPRESENTATIVE
++    u1 = ImageRecord(
++        path="/p/a", relative_path="a", filename="a", extension=".jpg", duplicate_group=2
++    )
++    u2 = ImageRecord(
++        path="/p/b", relative_path="b", filename="b", extension=".jpg", duplicate_group=2
++    )
++    select_best_shots([u1, u2], CFG)
++    assert {u1.group_role, u2.group_role} == {GroupRole.REPRESENTATIVE, GroupRole.SIMILAR}
++
++
++def test_singletons_are_unique():
++    solo = frame("a", 70, group=None)
++    select_best_shots([solo], CFG)
++    assert solo.group_role is GroupRole.UNIQUE and solo.is_group_representative
++
++
++# ------------------------------------------------------------------ verdict gate
++def test_closed_eyes_cap_the_verdict_at_review():
++    r = frame("a", 90, closed=1, subjects=4)
++    assert classify(r, ThresholdsConfig()) == (
++        Recommendation.REVIEW,
++        "Closed eyes on 1 of 4 faces; check first",
++    )
++    assert classify(r, ThresholdsConfig(closed_eyes_gate=False))[0] is Recommendation.SELECT
++
++
++def test_gate_never_promotes_a_weak_photo():
++    assert classify(frame("a", 30, closed=1), ThresholdsConfig())[0] is Recommendation.REJECT
++
++
++# -------------------------------------------------------------------- end to end
++class MarkerFaces(Analyzer):
++    """Fake face analyzer that reads which 'person state' a frame has from pixel (0, 0)."""
++
++    name = "faces"
++    section = "faces"
++    result_type = FaceAnalysis
++
++    def analyze(self, ctx):
++        marker = int(ctx.rgb[0, 0, 0])
++        ear = CLOSED if marker == 1 else OPEN
++        people = [face(0.03, x=200), face(0.03, x=500), face(0.03, ear=ear, x=800)]
++        return faces(*people)
++
++
++def marked(base, marker, blur=0.0):
++    image = cv2.GaussianBlur(base, (0, 0), blur) if blur else base.copy()
++    image[0, 0] = marker  # one pixel: invisible to the perceptual hash
++    return image
++
++
++def test_group_shot_picks_the_frame_where_nobody_blinks(settings, tmp_path):
++    """The blinking frame is technically sharper, so it still outscores the open-eyes frame
++    even after the closed-eyes caps; selection must prefer the open-eyes one inside the margin."""
++    settings.selection.margin = 20
++    root = tmp_path / "in"
++    base = np.random.default_rng(1).integers(0, 255, (480, 640, 3), dtype=np.uint8)
++    save(marked(base, 1), root / "a_blink_sharper.png")
++    save(marked(base, 2, blur=1.2), root / "b_open_eyes.png")
++
++    result = Pipeline(settings, analyzers=[TechnicalAnalyzer(), MarkerFaces()]).run(root)
++    a, b = sorted(result.records, key=lambda r: r.filename)
++
++    assert a.duplicate_group == b.duplicate_group is not None
++    gap = a.scores.selection - b.scores.selection  # premise of this test
++    assert 0 < gap < settings.selection.margin, f"scoring changed: gap is {gap:.1f}"
++    assert a.scores.group.closed_eyes == [2] and b.scores.group.closed_eyes == []
++
++    assert b.group_role is GroupRole.REPRESENTATIVE
++    assert a.group_role is GroupRole.SIMILAR
++    assert "fewer problems" in b.selection_reason
++    assert "Closed eyes" in a.selection_reason
++    assert a.recommendation is Recommendation.REVIEW  # also gated by the closed eyes
++
++
++def test_a_much_sharper_blink_frame_still_wins_outside_the_margin(settings, tmp_path):
++    settings.selection.margin = 5
++    root = tmp_path / "in"
++    base = np.random.default_rng(1).integers(0, 255, (480, 640, 3), dtype=np.uint8)
++    save(marked(base, 1), root / "a_blink_sharp.png")
++    save(marked(base, 2, blur=2.0), root / "b_open_blurry.png")
++    result = Pipeline(settings, analyzers=[TechnicalAnalyzer(), MarkerFaces()]).run(root)
++    a, b = sorted(result.records, key=lambda r: r.filename)
++    assert a.scores.selection - b.scores.selection > settings.selection.margin
++    assert a.group_role is GroupRole.REPRESENTATIVE
++
++
++def test_report_lists_closed_eye_photos(settings, tmp_path):
++    root = tmp_path / "in"
++    base = textured(2)
++    save(marked(base, 1), root / "blink.png")
++    save(textured(9), root / "fine.png")
++    report = build_report(
++        Pipeline(settings, analyzers=[TechnicalAnalyzer(), MarkerFaces()]).run(root)
++    )
++    assert report.summary.closed_eyes_photos == 1
+diff --git a/tests/test_scoring.py b/tests/test_scoring.py
+index 7340c19..7e9374b 100644
+--- a/tests/test_scoring.py
++++ b/tests/test_scoring.py
+@@ -69,7 +69,7 @@ def test_no_faces_is_neutral_not_penalised():
+ 
+ 
+ def test_two_faces_weight_the_weaker_one():
+-    good, bad = _face(), _face(eyes=EyeMetrics(left=0.1, right=0.1, average=0.1))
++    good, bad = _face(), _face(eyes=EyeMetrics(left=0.16, right=0.16, average=0.16))  # squint
+     s, _ = score_subject(FaceAnalysis(face_count=2, faces=[good, bad]))
+     only_good = score_subject(FaceAnalysis(face_count=1, faces=[good]))[0]
+     only_bad = score_subject(FaceAnalysis(face_count=1, faces=[bad]))[0]
+-- 
+2.43.0
+
+
+From 04c6ab3e45d791e63db955885fad57e5e979167b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 01:32:48 +0000
+Subject: [PATCH 4/5] feat: reliable burst culling from EXIF time, appearance
+ and sharpness
+
+Grouping used perceptual-hash distance alone, so frames of a burst that moved
+or panned more than 8 bits were never grouped, and best-shot choice could be
+decided by the AI label (which flips between near-identical frames) rather than
+by motion blur.
+
+- Capture time from EXIF DateTimeOriginal/Digitized with sub-seconds (bursts fall
+  inside one second). File mtime is deliberately not used: copying resets it and
+  a wrong time is worse than none
+- Burst links: a frame joins any frame within bursts.max_gap_seconds that looks
+  continuous (hamming <= bursts.hamming_threshold, looser than duplicates). Looking
+  back over a window, not just the previous frame, keeps a burst intact when
+  another photographer's frames interleave. Chains are cut at max_span_seconds
+- Groups are union-find over appearance clusters and burst links, with stable ids.
+  Each gets a kind (duplicate = byte-identical, burst, similar) and time span.
+  Frames without capture time still group by appearance exactly as before
+- Selection compares frames on relative sharpness: a frame much softer than the
+  group's sharpest loses up to selection.sharpness_weight points. Absolute sharpness
+  saturates when every frame is soft or crisp, so it cannot tell a smeared frame
+  from a good one. Landscapes use the tiled measure. Reasons now say when a frame
+  was dropped for being soft
+- Report: captured_at/group_kind CSV columns, summary burst_groups/burst_frames,
+  TL;DR mentions bursts
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ src/media_culler/config.py     |  27 ++++
+ src/media_culler/curation.py   |  37 ++++-
+ src/media_culler/duplicates.py | 131 +++++++++++++--
+ src/media_culler/imaging.py    |  43 ++++-
+ src/media_culler/models.py     |   9 ++
+ src/media_culler/pipeline.py   |   7 +-
+ src/media_culler/reporting.py  |  11 +-
+ src/media_culler/scanner.py    |   1 +
+ src/media_culler/ui/render.py  |   9 +-
+ tests/conftest.py              |  17 ++
+ tests/test_bursts.py           | 285 +++++++++++++++++++++++++++++++++
+ tests/test_groups.py           |   1 +
+ 12 files changed, 554 insertions(+), 24 deletions(-)
+ create mode 100644 tests/test_bursts.py
+
+diff --git a/src/media_culler/config.py b/src/media_culler/config.py
+index 419d0e6..d82faab 100644
+--- a/src/media_culler/config.py
++++ b/src/media_culler/config.py
+@@ -156,6 +156,21 @@ class SceneConfig(_Section):
+     heuristic_horizon_confidence: float = Field(0.6, ge=0, le=1)
+ 
+ 
++class BurstConfig(_Section):
++    """Group frames shot moments apart even when they differ more than a plain duplicate.
++
++    A burst is a chain of photos where each is within ``max_gap_seconds`` of the previous one
++    and looks continuous with it (perceptual-hash distance <= ``hamming_threshold``). Needs
++    EXIF capture times; photos without them are still grouped by appearance alone.
++    """
++
++    enabled: bool = True
++    max_gap_seconds: float = Field(2.0, gt=0)
++    hamming_threshold: int = Field(14, ge=0, le=32)
++    # A chain is cut once it spans this long, so a slow walk can't chain a whole afternoon.
++    max_span_seconds: float = Field(20.0, gt=0)
++
++
+ class SelectionConfig(_Section):
+     """Who counts as a subject, when eyes count as closed, and how best shots are chosen."""
+ 
+@@ -174,6 +189,10 @@ class SelectionConfig(_Section):
+     # Among similar frames, only those within this many points of the best may win on
+     # "nobody blinked", so a sharp frame is never beaten by a blurry one just for open eyes.
+     margin: float = Field(12, ge=0, le=100)
++    # Within a group, a frame much softer than the group's sharpest loses up to this many
++    # points. Motion blur is the commonest reason to discard a burst frame, and the absolute
++    # sharpness score saturates when frames are all soft or all crisp.
++    sharpness_weight: float = Field(15, ge=0, le=50)
+ 
+ 
+ class PerformanceConfig(_Section):
+@@ -192,6 +211,7 @@ class Settings(_Section):
+     faces: FacesConfig = FacesConfig()
+     scene: SceneConfig = SceneConfig()
+     selection: SelectionConfig = SelectionConfig()
++    bursts: BurstConfig = BurstConfig()
+     performance: PerformanceConfig = PerformanceConfig()
+ 
+     @property
+@@ -356,6 +376,13 @@ selection:                          # group photos and best-shot choice
+   closed_face_cap: 45               # max score of a face with closed eyes
+   closed_subject_cap: 60            # max subject score if any subject has closed eyes
+   margin: 12                        # open-eyes can only win within this many points of the best
++  sharpness_weight: 15              # points lost by a frame much softer than its group's sharpest
++
++bursts:                             # group frames shot moments apart (needs EXIF time)
++  enabled: true
++  max_gap_seconds: 2.0              # max time between consecutive frames of one burst
++  hamming_threshold: 14             # how alike consecutive frames must look (looser than dupes)
++  max_span_seconds: 20.0            # cut a chain after this long
+ 
+ performance:
+   workers: 4
+diff --git a/src/media_culler/curation.py b/src/media_culler/curation.py
+index 14554de..5a5dd68 100644
+--- a/src/media_culler/curation.py
++++ b/src/media_culler/curation.py
+@@ -77,6 +77,10 @@ def apply_recommendations(records: list[ImageRecord], thresholds: ThresholdsConf
+             record.recommendation, record.recommendation_reason = classify(record, thresholds)
+ 
+ 
++# A frame this much softer than its group's sharpest is called out by name in the reason.
++_SOFT_RELATIVE = 0.7
++
++
+ def _selection_value(record: ImageRecord) -> float:
+     """Selection score, falling back to the final score for records that predate it."""
+     scores = record.scores
+@@ -110,10 +114,27 @@ def select_best_shots(records: list[ImageRecord], config: SelectionConfig | None
+         _select_in_group(members, config)
+ 
+ 
++def _frame_sharpness(record: ImageRecord) -> float:
++    """Raw sharpness for comparing frames of one scene (tiled measure if we have it)."""
++    values = [record.technical.sharpness] if record.technical else []
++    if record.scene is not None:
++        values.append(record.scene.sharpness_focus)
++    return max(values, default=0.0)
++
++
+ def _select_in_group(members: list[ImageRecord], config: SelectionConfig) -> None:
+     scored = [r for r in members if _selection_value(r) >= 0]
+     pool = scored or members
+ 
++    sharpest = max((_frame_sharpness(r) for r in pool), default=0.0)
++
++    def relative_sharpness(record: ImageRecord) -> float:
++        return _frame_sharpness(record) / sharpest if sharpest > 0 else 1.0
++
++    def value(record: ImageRecord) -> float:
++        penalty = config.sharpness_weight * (1.0 - relative_sharpness(record))
++        return _selection_value(record) - penalty
++
+     # The median (not max) face count, so one false detection can't make every other frame
+     # look like it lost a person.
+     typical = int(statistics.median_high([_significant_faces(r) for r in pool]))
+@@ -121,10 +142,10 @@ def _select_in_group(members: list[ImageRecord], config: SelectionConfig) -> Non
+     def problems(record: ImageRecord) -> int:
+         return _closed_eyes(record) + max(0, typical - _significant_faces(record))
+ 
+-    top = max(_selection_value(r) for r in pool)
+-    contenders = [r for r in pool if _selection_value(r) >= top - config.margin]
+-    best = min(contenders, key=lambda r: (problems(r), -_selection_value(r), r.path))
+-    strongest = min(pool, key=lambda r: (-_selection_value(r), r.path))
++    top = max(value(r) for r in pool)
++    contenders = [r for r in pool if value(r) >= top - config.margin]
++    best = min(contenders, key=lambda r: (problems(r), -value(r), r.path))
++    strongest = min(pool, key=lambda r: (-value(r), r.path))
+ 
+     for record in members:
+         record.best_shot_score = best.final_score
+@@ -142,13 +163,17 @@ def _select_in_group(members: list[ImageRecord], config: SelectionConfig) -> Non
+         else:
+             record.group_role = GroupRole.SIMILAR
+             record.is_group_representative = False
+-            record.selection_reason = _why_not(record, best, problems(record), problems(best))
++            record.selection_reason = _why_not(
++                record, problems(record), problems(best), relative_sharpness(record)
++            )
+ 
+ 
+-def _why_not(record: ImageRecord, best: ImageRecord, mine: int, theirs: int) -> str:
++def _why_not(record: ImageRecord, mine: int, theirs: int, relative_sharpness: float) -> str:
+     closed = _closed_eyes(record)
+     if closed and mine > theirs:
+         return f"Closed eyes on {closed} face(s); a better frame exists in this group"
+     if mine > theirs:
+         return "A subject is missing or turned away compared with the best frame"
++    if relative_sharpness < _SOFT_RELATIVE:
++        return f"Softer than the sharpest frame ({relative_sharpness:.0%} as sharp)"
+     return "Lower selection score than the group's best shot"
+diff --git a/src/media_culler/duplicates.py b/src/media_culler/duplicates.py
+index 3ad465d..749bfbf 100644
+--- a/src/media_culler/duplicates.py
++++ b/src/media_culler/duplicates.py
+@@ -2,9 +2,13 @@
+ 
+ from __future__ import annotations
+ 
++from collections import deque
++from datetime import datetime
++
+ import numpy as np
+ 
+-from media_culler.models import ImageRecord
++from media_culler.config import BurstConfig
++from media_culler.models import GroupKind, ImageRecord
+ 
+ 
+ def _popcount(values: np.ndarray) -> np.ndarray:
+@@ -44,19 +48,124 @@ def group_hashes(hashes: list[str], threshold: int) -> list[list[int]]:
+     return groups
+ 
+ 
+-def assign_duplicate_groups(records: list[ImageRecord], threshold: int) -> int:
+-    """Annotate records in place. Returns the number of groups with 2+ images."""
++class _Components:
++    """Union-find that remembers the earliest capture time of each component."""
++
++    def __init__(self, size: int, times: list[datetime | None]) -> None:
++        self._parent = list(range(size))
++        self._start: dict[int, datetime] = {i: t for i, t in enumerate(times) if t is not None}
++
++    def find(self, item: int) -> int:
++        while self._parent[item] != item:
++            self._parent[item] = self._parent[self._parent[item]]
++            item = self._parent[item]
++        return item
++
++    def start(self, item: int) -> datetime | None:
++        return self._start.get(self.find(item))
++
++    def union(self, a: int, b: int) -> None:
++        root_a, root_b = self.find(a), self.find(b)
++        if root_a == root_b:
++            return
++        self._parent[root_b] = root_a
++        earliest = [t for t in (self._start.pop(root_a, None), self._start.pop(root_b, None)) if t]
++        if earliest:
++            self._start[root_a] = min(earliest)
++
++
++def _link_bursts(
++    components: _Components,
++    hashes: list[int],
++    times: list[datetime | None],
++    config: BurstConfig,
++) -> None:
++    """Link each frame to every recent frame it looks continuous with.
++
++    Looking back over a time window (not just at the previous frame) keeps a burst intact
++    when another photographer's frames interleave with it. Chains are cut once a group
++    spans ``max_span_seconds`` so a slow walk can't chain a whole afternoon together.
++    """
++    order = sorted((i for i, t in enumerate(times) if t is not None), key=lambda i: (times[i], i))
++    window: deque[int] = deque()
++    for index in order:
++        moment = times[index]
++        assert moment is not None
++        while window and (moment - times[window[0]]).total_seconds() > config.max_gap_seconds:  # type: ignore[operator]
++            window.popleft()
++        for other in window:
++            if (hashes[index] ^ hashes[other]).bit_count() > config.hamming_threshold:
++                continue
++            begun = components.start(other)
++            if begun is not None and (moment - begun).total_seconds() > config.max_span_seconds:
++                continue
++            components.union(other, index)
++        window.append(index)
++
++
++def _parse_time(value: str | None) -> datetime | None:
++    if not value:
++        return None
++    try:
++        return datetime.fromisoformat(value)
++    except ValueError:
++        return None
++
++
++def _classify_group(members: list[ImageRecord], max_span: float) -> tuple[GroupKind, float | None]:
++    shas = {r.sha256 for r in members}
++    times = [_parse_time(r.captured_at) for r in members]
++    span: float | None = None
++    if all(t is not None for t in times):
++        stamps = [t for t in times if t is not None]
++        span = round((max(stamps) - min(stamps)).total_seconds(), 3)
++    if len(shas) == 1 and None not in shas:
++        return GroupKind.DUPLICATE, span
++    if span is not None and span <= max_span:
++        return GroupKind.BURST, span
++    return GroupKind.SIMILAR, span
++
++
++def assign_duplicate_groups(
++    records: list[ImageRecord], threshold: int | None, bursts: BurstConfig | None = None
++) -> int:
++    """Group similar images and bursts; annotate records in place.
++
++    ``threshold`` is the perceptual-hash distance for "looks the same" (None skips that
++    pass). ``bursts`` adds time-aware links. Returns the number of groups with 2+ images.
++    """
+     hashable = [r for r in records if r.status == "valid" and r.technical is not None]
+     hashable.sort(key=lambda r: r.path)  # deterministic group ids
++    hashes = [int(r.technical.perceptual_hash, 16) for r in hashable]  # type: ignore[union-attr]
++    times = [_parse_time(r.captured_at) for r in hashable]
++    components = _Components(len(hashable), times)
++
++    if threshold is not None:
++        clusters = group_hashes([r.technical.perceptual_hash for r in hashable], threshold)  # type: ignore[union-attr]
++        for cluster in clusters:
++            for other in cluster[1:]:
++                components.union(cluster[0], other)
++    if bursts is not None and bursts.enabled:
++        _link_bursts(components, hashes, times, bursts)
+ 
++    grouped: dict[int, list[int]] = {}
++    for index in range(len(hashable)):
++        grouped.setdefault(components.find(index), []).append(index)
++
++    max_span = (bursts or BurstConfig()).max_span_seconds
+     group_id = 0
+-    for members in group_hashes([r.technical.perceptual_hash for r in hashable], threshold):  # type: ignore[union-attr]
++    for member_indexes in sorted(grouped.values(), key=lambda m: m[0]):
++        members = [hashable[i] for i in member_indexes]
+         size = len(members)
+-        group_id_for_members = None
+-        if size > 1:
+-            group_id += 1
+-            group_id_for_members = group_id
+-        for index in members:
+-            hashable[index].duplicate_group_size = size
+-            hashable[index].duplicate_group = group_id_for_members
++        if size == 1:
++            members[0].duplicate_group_size = 1
++            members[0].duplicate_group = None
++            continue
++        group_id += 1
++        kind, span = _classify_group(members, max_span)
++        for record in members:
++            record.duplicate_group = group_id
++            record.duplicate_group_size = size
++            record.group_kind = kind
++            record.group_span_seconds = span
+     return group_id
+diff --git a/src/media_culler/imaging.py b/src/media_culler/imaging.py
+index 29413ea..b96c672 100644
+--- a/src/media_culler/imaging.py
++++ b/src/media_culler/imaging.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ import contextlib
+ import hashlib
+ from dataclasses import dataclass
++from datetime import datetime
+ from functools import cached_property
+ from pathlib import Path
+ 
+@@ -27,6 +28,10 @@ except ImportError:  # core install: HEIC/HEIF files simply fail to open (report
+     HEIF_AVAILABLE = False
+ 
+ EXIF_ORIENTATION = 0x0112
++_EXIF_IFD = 0x8769
++_TIME_TAGS = (0x9003, 0x9004)  # DateTimeOriginal, DateTimeDigitized
++_SUBSEC_TAGS = {0x9003: 0x9291, 0x9004: 0x9292}
++_TIME_FORMAT = "%Y:%m:%d %H:%M:%S"
+ _SWAPPED_ORIENTATIONS = {5, 6, 7, 8}
+ _HASH_CHUNK = 1024 * 1024
+ 
+@@ -36,6 +41,7 @@ class ImageHeader:
+     width: int  # orientation-corrected
+     height: int
+     format: str | None
++    captured_at: str | None = None  # ISO 8601, naive local time as written by the camera
+ 
+ 
+ def configure_pillow(max_pixels: int) -> None:
+@@ -51,13 +57,46 @@ def sha256_file(path: Path) -> str:
+     return hasher.hexdigest()
+ 
+ 
++def parse_capture_time(exif: Image.Exif) -> str | None:
++    """Capture time from EXIF as a naive ISO string, or None.
++
++    Cameras write local time with no zone, so only *differences* between photos are
++    meaningful. Sub-second digits are kept: bursts routinely fall inside one second.
++    File modification time is deliberately NOT used as a fallback: copying or exporting
++    resets it, and a wrong time is worse than none (grouping then falls back to
++    appearance alone).
++    """
++    try:
++        ifd = exif.get_ifd(_EXIF_IFD)
++    except Exception:  # malformed EXIF
++        return None
++    for tag in _TIME_TAGS:
++        raw = ifd.get(tag)
++        if not isinstance(raw, str):
++            continue
++        try:
++            moment = datetime.strptime(raw.strip().rstrip("\x00"), _TIME_FORMAT)
++        except ValueError:
++            continue  # includes the "0000:00:00 00:00:00" some cameras write
++        subsec = ifd.get(_SUBSEC_TAGS[tag])
++        if isinstance(subsec, str | bytes):
++            digits = subsec.decode(errors="ignore") if isinstance(subsec, bytes) else subsec
++            digits = digits.strip().rstrip("\x00")
++            if digits.isdigit():
++                moment = moment.replace(microsecond=int(float("0." + digits) * 1_000_000))
++        return moment.isoformat()
++    return None
++
++
+ def read_header(path: Path, max_pixels: int) -> ImageHeader:
+     """Read dimensions/format without decoding pixels. Raises ImageLoadError."""
+     try:
+         with Image.open(path) as image:
+             width, height = image.size
+             fmt = image.format
+-            orientation = image.getexif().get(EXIF_ORIENTATION)
++            exif = image.getexif()
++            orientation = exif.get(EXIF_ORIENTATION)
++            captured_at = parse_capture_time(exif)
+     except Exception as error:  # PIL raises many types for corrupt input
+         raise ImageLoadError(f"Cannot open image: {error}") from error
+ 
+@@ -65,7 +104,7 @@ def read_header(path: Path, max_pixels: int) -> ImageHeader:
+         raise ImageLoadError(f"Image too large ({width}x{height} > {max_pixels} pixels)")
+     if orientation in _SWAPPED_ORIENTATIONS:
+         width, height = height, width
+-    return ImageHeader(width=width, height=height, format=fmt)
++    return ImageHeader(width=width, height=height, format=fmt, captured_at=captured_at)
+ 
+ 
+ def load_rgb(path: Path, max_pixels: int) -> np.ndarray:
+diff --git a/src/media_culler/models.py b/src/media_culler/models.py
+index 72fbe0e..92bf2ed 100644
+--- a/src/media_culler/models.py
++++ b/src/media_culler/models.py
+@@ -22,6 +22,12 @@ class SceneType(str, Enum):
+     GENERAL = "general"
+ 
+ 
++class GroupKind(str, Enum):
++    DUPLICATE = "duplicate"  # byte-identical files
++    BURST = "burst"  # taken within moments of each other and visually continuous
++    SIMILAR = "similar"  # look alike but not a burst (different times, or no capture time)
++
++
+ class GroupRole(str, Enum):
+     UNIQUE = "unique"
+     REPRESENTATIVE = "representative"
+@@ -149,6 +155,7 @@ class ImageRecord(BaseModel):
+     height: int = 0
+     format: str | None = None
+     modified_at: str | None = None
++    captured_at: str | None = None  # EXIF capture time (naive local ISO), if present
+     sha256: str | None = None
+ 
+     technical: TechnicalMetrics | None = None
+@@ -167,6 +174,8 @@ class ImageRecord(BaseModel):
+ 
+     duplicate_group: int | None = None
+     duplicate_group_size: int = 1
++    group_kind: GroupKind | None = None
++    group_span_seconds: float | None = None  # first to last capture time within the group
+     group_role: GroupRole | None = None
+     is_group_representative: bool | None = None
+     best_shot_score: float | None = None
+diff --git a/src/media_culler/pipeline.py b/src/media_culler/pipeline.py
+index 77c128a..d3e192c 100644
+--- a/src/media_culler/pipeline.py
++++ b/src/media_culler/pipeline.py
+@@ -235,10 +235,13 @@ class Pipeline:
+ 
+     def _curate(self, result: RunResult) -> None:
+         records = result.records
+-        if self.settings.duplicates.enabled:
++        duplicates, bursts = self.settings.duplicates, self.settings.bursts
++        if duplicates.enabled or bursts.enabled:
+             self.reporter.stage("Grouping similar images", None)
+             result.duplicate_groups = assign_duplicate_groups(
+-                records, self.settings.duplicates.hamming_threshold
++                records,
++                duplicates.hamming_threshold if duplicates.enabled else None,
++                bursts,
+             )
+         self.reporter.stage("Scoring", None)
+         for record in records:
+diff --git a/src/media_culler/reporting.py b/src/media_culler/reporting.py
+index 3c46723..5d8432b 100644
+--- a/src/media_culler/reporting.py
++++ b/src/media_culler/reporting.py
+@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, ValidationError
+ 
+ from media_culler import __version__
+ from media_culler.exceptions import ReportError
+-from media_culler.models import GroupRole, ImageRecord, Recommendation
++from media_culler.models import GroupKind, GroupRole, ImageRecord, Recommendation
+ from media_culler.pipeline import RunResult
+ 
+ SCHEMA_VERSION = 3
+@@ -42,6 +42,8 @@ class Summary(BaseModel):
+     analyzer_failures: dict[str, int]
+     scene_counts: dict[str, int] = Field(default_factory=dict)
+     closed_eyes_photos: int = 0
++    burst_groups: int = 0
++    burst_frames: int = 0
+     top: list[TopImage]
+ 
+ 
+@@ -80,6 +82,7 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int
+             key = record.scores.scene_type.value
+             scenes[key] = scenes.get(key, 0) + 1
+ 
++    bursts = [r for r in valid if r.group_kind == GroupKind.BURST]
+     values = [r.final_score for r in scored if r.final_score is not None]
+     return Summary(
+         total_files=len(records),
+@@ -94,6 +97,8 @@ def build_summary(records: list[ImageRecord], duplicate_groups: int, top_n: int
+         median_score=round(statistics.median(values), 2) if values else None,
+         analyzer_failures=failures,
+         scene_counts=dict(sorted(scenes.items())),
++        burst_groups=len({r.duplicate_group for r in bursts}),
++        burst_frames=len(bursts),
+         closed_eyes_photos=sum(
+             1 for r in valid if r.scores and r.scores.group and r.scores.group.closed_eyes
+         ),
+@@ -160,6 +165,8 @@ CSV_COLUMNS = [
+     "subjects",
+     "closed_eyes",
+     "duplicate_group",
++    "group_kind",
++    "captured_at",
+     "group_role",
+     "width",
+     "height",
+@@ -187,6 +194,8 @@ def _csv_row(r: ImageRecord) -> dict[str, Any]:
+         "subjects": len(s.group.significant) if s and s.group else None,
+         "closed_eyes": len(s.group.closed_eyes) if s and s.group else None,
+         "duplicate_group": r.duplicate_group,
++        "group_kind": r.group_kind.value if r.group_kind else "",
++        "captured_at": r.captured_at or "",
+         "group_role": r.group_role.value if r.group_role else "",
+         "width": r.width,
+         "height": r.height,
+diff --git a/src/media_culler/scanner.py b/src/media_culler/scanner.py
+index 7d36872..c1c0389 100644
+--- a/src/media_culler/scanner.py
++++ b/src/media_culler/scanner.py
+@@ -76,6 +76,7 @@ def build_record(path: Path, root: Path, max_pixels: int) -> ImageRecord:
+         record.size_bytes = stat.st_size
+         record.width, record.height, record.format = header.width, header.height, header.format
+         record.modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
++        record.captured_at = header.captured_at
+         record.sha256 = sha256_file(path)
+     except (ImageLoadError, OSError) as error:
+         record.status = "error"
+diff --git a/src/media_culler/ui/render.py b/src/media_culler/ui/render.py
+index ffb4820..9becdc8 100644
+--- a/src/media_culler/ui/render.py
++++ b/src/media_culler/ui/render.py
+@@ -70,10 +70,15 @@ def tldr_panel(report: Report, report_path: Path | None = None) -> Panel:
+ 
+     lines: list[RenderableType] = [headline]
+     if s.duplicate_groups:
++        plural = "s" if s.duplicate_groups != 1 else ""
++        bursts = (
++            f" ({s.burst_groups} burst{'s' if s.burst_groups != 1 else ''})"
++            if s.burst_groups
++            else ""
++        )
+         lines.append(
+             Text(
+-                f"{s.duplicate_groups} group{'s' if s.duplicate_groups != 1 else ''} "
+-                f"of similar shots; "
++                f"{s.duplicate_groups} group{plural} of similar shots{bursts}; "
+                 f"{s.redundant_images} weaker alternate{'s' if s.redundant_images != 1 else ''} "
+                 "you can skip"
+             )
+diff --git a/tests/conftest.py b/tests/conftest.py
+index d1a1641..bb0ca28 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -84,3 +84,20 @@ def landscape_image(
+         matrix = cv2.getRotationMatrix2D((width / 2, height / 2), tilt, 1.0)
+         image = cv2.warpAffine(image, matrix, (width, height), borderMode=cv2.BORDER_REPLICATE)
+     return image
++
++
++def save_timed(array: np.ndarray, path: Path, when: str | None, subsec: str | None = None) -> Path:
++    """Save with EXIF DateTimeOriginal (``when`` like '2026:06:12 07:07:26') and optional subsec."""
++    exif = Image.Exif()
++    if when is not None:
++        ifd = exif.get_ifd(0x8769)
++        ifd[0x9003] = when
++        if subsec is not None:
++            ifd[0x9291] = subsec
++    path.parent.mkdir(parents=True, exist_ok=True)
++    # Pass bytes: an Exif holding only a sub-IFD is falsy, so Pillow's PNG writer skips it.
++    options: dict[str, object] = {"exif": exif.tobytes()}
++    if path.suffix == ".jpg":
++        options["quality"] = 95
++    Image.fromarray(array).save(path, **options)  # type: ignore[arg-type]
++    return path
+diff --git a/tests/test_bursts.py b/tests/test_bursts.py
+new file mode 100644
+index 0000000..0851d5f
+--- /dev/null
++++ b/tests/test_bursts.py
+@@ -0,0 +1,285 @@
++from datetime import datetime, timedelta
++
++import cv2
++import numpy as np
++import pytest
++from PIL import Image
++
++from conftest import save_timed
++from media_culler.analyzers.technical import TechnicalAnalyzer, perceptual_hash
++from media_culler.config import BurstConfig, SelectionConfig
++from media_culler.curation import select_best_shots
++from media_culler.duplicates import assign_duplicate_groups, hamming_distance
++from media_culler.imaging import parse_capture_time, read_header
++from media_culler.models import (
++    GroupAssessment,
++    GroupKind,
++    GroupRole,
++    ImageRecord,
++    Scores,
++    TechnicalMetrics,
++)
++from media_culler.pipeline import Pipeline
++from media_culler.reporting import build_report
++from media_culler.scanner import scan_directory
++
++T0 = datetime(2026, 6, 12, 7, 7, 26)
++BURST = BurstConfig()
++
++
++# ------------------------------------------------------------------- capture time
++def exif_with(**tags) -> Image.Exif:
++    exif = Image.Exif()
++    ifd = exif.get_ifd(0x8769)
++    for tag, value in tags.items():
++        ifd[int(tag.removeprefix("t"), 16)] = value
++    return exif
++
++
++def test_capture_time_with_subseconds():
++    exif = exif_with(t9003="2026:06:12 07:07:26", t9291="45")
++    assert parse_capture_time(exif) == "2026-06-12T07:07:26.450000"
++    assert parse_capture_time(exif_with(t9003="2026:06:12 07:07:26", t9291="123")) == (
++        "2026-06-12T07:07:26.123000"
++    )
++
++
++def test_capture_time_fallbacks_and_garbage():
++    assert parse_capture_time(exif_with(t9004="2026:06:12 07:07:26")) == "2026-06-12T07:07:26"
++    original_wins = exif_with(t9003="2026:06:12 07:07:26", t9004="2020:01:01 00:00:00")
++    assert parse_capture_time(original_wins) == "2026-06-12T07:07:26"
++    for junk in ("0000:00:00 00:00:00", "not a date", "", "2026-06-12 07:07:26"):
++        assert parse_capture_time(exif_with(t9003=junk)) is None
++    assert parse_capture_time(Image.Exif()) is None
++    assert parse_capture_time(exif_with(t9003="2026:06:12 07:07:26", t9291="xx")) == (
++        "2026-06-12T07:07:26"
++    )  # unreadable sub-seconds: keep the whole second
++
++
++def test_header_and_scanner_expose_capture_time(settings, tmp_path):
++    root = tmp_path / "in"
++    pixels = np.zeros((40, 60, 3), np.uint8)
++    save_timed(pixels, root / "timed.jpg", "2026:06:12 07:07:26", "5")
++    save_timed(pixels, root / "untimed.jpg", None)
++    assert read_header(root / "timed.jpg", 10**9).captured_at == "2026-06-12T07:07:26.500000"
++    by = {r.filename: r for r in scan_directory(root, settings)}
++    assert by["timed.jpg"].captured_at == "2026-06-12T07:07:26.500000"
++    assert by["untimed.jpg"].captured_at is None  # never guessed from file mtime
++
++
++# ---------------------------------------------------------------------- grouping
++def shot(name, bits=0, at=0.0, sha=None, timed=True) -> ImageRecord:
++    """A frame whose perceptual hash is ``bits`` low bits set, captured ``at`` seconds after T0."""
++    r = ImageRecord(path=f"/p/{name}", relative_path=name, filename=name, extension=".jpg")
++    r.sha256 = sha or f"sha-{name}"
++    r.captured_at = (T0 + timedelta(seconds=at)).isoformat() if timed else None
++    r.technical = TechnicalMetrics(
++        sharpness=300,
++        brightness=125,
++        contrast=60,
++        megapixels=12,
++        perceptual_hash=f"{(1 << bits) - 1:016x}",
++    )
++    return r
++
++
++def group_of(records):
++    return {r.filename: r.duplicate_group for r in records}
++
++
++def test_hash_helper_distances_are_what_the_tests_assume():
++    assert (
++        hamming_distance(
++            shot("a", 0).technical.perceptual_hash, shot("b", 10).technical.perceptual_hash
++        )
++        == 10
++    )
++
++
++def test_consecutive_similar_frames_form_a_burst_a_plain_duplicate_pass_would_miss():
++    frames = [shot("a", 0, 0.0), shot("b", 10, 0.4)]  # 10 bits apart: more than duplicates allow
++    assert assign_duplicate_groups(frames, 8) == 0
++    assert assign_duplicate_groups(frames, 8, BURST) == 1
++    assert frames[0].group_kind is GroupKind.BURST and frames[0].group_span_seconds == 0.4
++
++
++def test_the_time_gap_limit_is_respected():
++    frames = [shot("a", 0, 0.0), shot("b", 10, 2.5)]
++    assert assign_duplicate_groups(frames, 8, BURST) == 0
++    frames = [shot("a", 0, 0.0), shot("b", 10, 2.0)]  # exactly at the limit still links
++    assert assign_duplicate_groups(frames, 8, BURST) == 1
++
++
++def test_unrelated_frames_at_the_same_instant_are_not_a_burst():
++    frames = [shot("a", 0, 0.0), shot("b", 25, 0.0)]
++    assert assign_duplicate_groups(frames, 8, BURST) == 0
++
++
++def test_chaining_follows_a_pan_where_first_and_last_look_different():
++    a, b, c = shot("a", 0, 0.0), shot("b", 10, 0.5), shot("c", 20, 1.0)
++    c.technical.perceptual_hash = f"{(1 << 20) - 1:016x}"
++    assert hamming_distance(a.technical.perceptual_hash, c.technical.perceptual_hash) == 20
++    assert assign_duplicate_groups([a, b, c], 8, BURST) == 1
++    assert len({a.duplicate_group, b.duplicate_group, c.duplicate_group}) == 1
++
++
++def test_long_chains_are_cut_at_max_span():
++    frames = [shot(f"f{i:02d}", 0, float(i)) for i in range(0, 31)]  # one a second for 30 s
++    # identical hashes, so appearance alone would join all; isolate the time rule:
++    assert assign_duplicate_groups(frames, None, BurstConfig(max_span_seconds=10)) >= 3
++    sizes = {r.duplicate_group: 0 for r in frames}
++    for r in frames:
++        sizes[r.duplicate_group] += 1
++    assert max(sizes.values()) <= 11  # 0..10 s inclusive
++
++
++def test_another_photographers_frames_do_not_break_a_burst():
++    a1, other, a2 = shot("a1", 0, 0.0), shot("x", 30, 0.5), shot("a2", 10, 1.0)
++    assert assign_duplicate_groups([a1, other, a2], None, BURST) == 1
++    assert a1.duplicate_group == a2.duplicate_group is not None and other.duplicate_group is None
++
++
++def test_frames_without_capture_time_fall_back_to_appearance_only():
++    near = [shot("a", 0, timed=False), shot("b", 5, timed=False)]
++    far = [shot("c", 0, timed=False), shot("d", 10, timed=False)]
++    assert assign_duplicate_groups(near, 8, BURST) == 1
++    assert assign_duplicate_groups(far, 8, BURST) == 0  # no time to justify the looser rule
++    assert near[0].group_kind is GroupKind.SIMILAR and near[0].group_span_seconds is None
++
++
++def test_bursts_can_be_disabled_and_duplicates_can_be_skipped():
++    frames = [shot("a", 0, 0.0), shot("b", 10, 0.4)]
++    assert assign_duplicate_groups(frames, 8, BurstConfig(enabled=False)) == 0
++    assert assign_duplicate_groups(frames, None, BURST) == 1  # bursts alone, no appearance pass
++    same_look = [shot("c", 0, 0.0), shot("d", 3, 600.0)]
++    assert assign_duplicate_groups(same_look, None, BURST) == 0
++
++
++def test_group_kinds():
++    twins = [shot("a", 0, 0.0, sha="same"), shot("b", 0, 0.0, sha="same")]
++    assign_duplicate_groups(twins, 8, BURST)
++    assert {r.group_kind for r in twins} == {GroupKind.DUPLICATE}
++
++    burst = [shot("c", 0, 0.0), shot("d", 4, 1.0)]
++    assign_duplicate_groups(burst, 8, BURST)
++    assert {r.group_kind for r in burst} == {GroupKind.BURST}
++
++    retake = [shot("e", 0, 0.0), shot("f", 4, 3600.0)]  # alike, an hour apart
++    assign_duplicate_groups(retake, 8, BURST)
++    assert {r.group_kind for r in retake} == {GroupKind.SIMILAR}
++    assert retake[0].group_span_seconds == 3600.0
++
++
++def test_group_ids_are_stable_and_ordered_by_path():
++    frames = [shot("z2", 0, 0.0), shot("z1", 3, 0.2), shot("a1", 20, 9.0), shot("a2", 22, 9.3)]
++    assign_duplicate_groups(frames, 8, BURST)
++    ids = group_of(frames)
++    assert ids["a1"] == ids["a2"] == 1 and ids["z1"] == ids["z2"] == 2
++
++
++def test_errors_and_unhashed_images_are_ignored():
++    bad = ImageRecord(
++        path="/p/bad", relative_path="bad", filename="bad", extension=".jpg", status="error"
++    )
++    no_hash = ImageRecord(path="/p/nh", relative_path="nh", filename="nh", extension=".jpg")
++    assert assign_duplicate_groups([bad, no_hash, shot("a")], 8, BURST) == 0
++
++
++# --------------------------------------------------- sharpness-aware selection
++def frame(name, selection, sharp, group=1) -> ImageRecord:
++    r = shot(name)
++    r.duplicate_group = group
++    r.technical.sharpness = sharp
++    r.scores = Scores(technical=80, final=selection, selection=selection, group=GroupAssessment())
++    return r
++
++
++def test_the_sharper_frame_wins_even_when_absolute_scores_saturate():
++    """Frames of a soft scene all hit the sharpness floor and tie on score; only the
++    relative measure can tell the motion-blurred one from the crisp one."""
++    crisp, smeared = frame("a", 70.0, sharp=40), frame("b", 70.0, sharp=10)
++    select_best_shots([smeared, crisp], SelectionConfig())
++    assert crisp.group_role is GroupRole.REPRESENTATIVE
++    assert smeared.group_role is GroupRole.SIMILAR
++    assert smeared.selection_reason == "Softer than the sharpest frame (25% as sharp)"
++
++
++def test_sharpness_weight_zero_restores_pure_score_ranking():
++    crisp, smeared = frame("a", 70.0, sharp=40), frame("b", 71.0, sharp=10)
++    select_best_shots([crisp, smeared], SelectionConfig(sharpness_weight=0))
++    assert smeared.group_role is GroupRole.REPRESENTATIVE
++
++
++def test_a_slightly_softer_frame_is_not_called_out_as_soft():
++    best, near = frame("a", 80.0, sharp=100), frame("b", 79.0, sharp=90)
++    select_best_shots([best, near], SelectionConfig())
++    assert near.selection_reason == "Lower selection score than the group's best shot"
++
++
++def test_landscape_tiled_sharpness_is_used_for_comparison():
++    from media_culler.models import SceneMetrics
++
++    def scene(focus):
++        return SceneMetrics(
++            highlight_clip=0,
++            shadow_clip=0,
++            dynamic_range=100,
++            sharpness_focus=focus,
++            saliency_x=0.5,
++            saliency_y=0.5,
++        )
++
++    a, b = frame("a", 70.0, sharp=5), frame("b", 70.0, sharp=5)  # global sharpness identical
++    a.scene, b.scene = scene(400), scene(100)
++    select_best_shots([a, b], SelectionConfig())
++    assert a.group_role is GroupRole.REPRESENTATIVE
++
++
++# ---------------------------------------------------------------------- end to end
++def panning_scene():
++    """Wide scene = smooth structure (what the perceptual hash sees) + fine grain (the detail
++    that motion blur destroys, and which Laplacian-variance sharpness measures)."""
++    rng = np.random.default_rng(2)
++    smooth = cv2.resize(
++        rng.integers(0, 255, (13, 40, 3), dtype=np.uint8),
++        (1920, 640),
++        interpolation=cv2.INTER_CUBIC,
++    ).astype(np.float32)
++    grain = np.random.default_rng(102).normal(0, 15, smooth.shape)
++    return np.clip(smooth + grain, 0, 255).astype(np.uint8)
++
++
++def test_panning_burst_is_grouped_and_the_motion_blurred_frame_is_dropped(settings, tmp_path):
++    wide = panning_scene()
++    crops = [np.ascontiguousarray(wide[:, dx : dx + 960]) for dx in (0, 40, 80)]
++    smear = np.full((1, 15), 1 / 15, np.float32)  # horizontal motion blur
++    crops[1] = cv2.filter2D(crops[1], -1, smear)
++
++    root = tmp_path / "in"
++    for index, (crop, subsec) in enumerate(zip(crops, ("10", "35", "60"), strict=True)):
++        save_timed(crop, root / f"burst_{index}.png", "2026:06:12 07:07:26", subsec)
++
++    hashes = [perceptual_hash(c) for c in crops]
++    assert hamming_distance(hashes[0], hashes[2]) > settings.duplicates.hamming_threshold, (
++        "premise: first and last frames must be beyond what a plain duplicate pass would join"
++    )
++
++    off = settings.model_copy(deep=True)
++    off.bursts.enabled = False
++    plain = Pipeline(off, analyzers=[TechnicalAnalyzer()]).run(root)
++    assert len({r.duplicate_group for r in plain.records if r.duplicate_group}) <= 1
++    assert any(r.duplicate_group is None for r in plain.records)  # not all joined without bursts
++
++    result = Pipeline(settings, analyzers=[TechnicalAnalyzer()]).run(root)
++    by = {r.filename: r for r in result.records}
++    assert {r.duplicate_group for r in by.values()} == {1}
++    assert {r.group_kind for r in by.values()} == {GroupKind.BURST}
++    assert by["burst_1.png"].group_span_seconds == pytest.approx(0.5, abs=0.01)
++    assert by["burst_1.png"].group_role is GroupRole.SIMILAR
++    assert by["burst_1.png"].selection_reason.startswith("Softer than the sharpest frame (")
++    kept = [r for r in by.values() if r.group_role is GroupRole.REPRESENTATIVE]
++    assert len(kept) == 1 and kept[0].filename in {"burst_0.png", "burst_2.png"}
++
++    report = build_report(result)
++    assert (report.summary.burst_groups, report.summary.burst_frames) == (1, 3)
++    assert report.summary.redundant_images == 2
+diff --git a/tests/test_groups.py b/tests/test_groups.py
+index 8380d6e..f779b5c 100644
+--- a/tests/test_groups.py
++++ b/tests/test_groups.py
+@@ -256,6 +256,7 @@ def test_group_shot_picks_the_frame_where_nobody_blinks(settings, tmp_path):
+     """The blinking frame is technically sharper, so it still outscores the open-eyes frame
+     even after the closed-eyes caps; selection must prefer the open-eyes one inside the margin."""
+     settings.selection.margin = 20
++    settings.selection.sharpness_weight = 0  # isolate the blink rule; sharpness is tested elsewhere
+     root = tmp_path / "in"
+     base = np.random.default_rng(1).integers(0, 255, (480, 640, 3), dtype=np.uint8)
+     save(marked(base, 1), root / "a_blink_sharper.png")
+-- 
+2.43.0
+
+
+From 70b23721129e52e95d951905200a137ed98ee2fb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 01:34:22 +0000
+Subject: [PATCH 5/5] docs: describe scene, group and burst behaviour; refresh
+ known limitations
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AVrJmEBWfEeojxr7zjNXdQ
+---
+ README.md | 58 +++++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 52 insertions(+), 6 deletions(-)
+
+diff --git a/README.md b/README.md
+index 0375830..8f04d8b 100644
+--- a/README.md
++++ b/README.md
+@@ -53,12 +53,13 @@ Exit codes: `0` ok · `1` runtime error · `2` bad usage/config · `130` interru
+ ## Architecture
+ 
+ ```
+-cli.py ─────────► pipeline.py ──► scanner.py        discover files, metadata, sha256 (threaded)
+- │  (Typer)         │            analyzers/          technical · vision (SigLIP) · faces (MediaPipe)
++cli.py ─────────► pipeline.py ──► scanner.py        discover files, metadata, EXIF time, sha256 (threaded)
++ │  (Typer)         │            analyzers/          technical · scene · vision (SigLIP) · faces (MediaPipe)
+  │                  │            cache.py            sqlite, keyed by (content hash, analyzer, fingerprint)
+- ▼                  ├──────────► duplicates.py       pHash Hamming grouping
++ ▼                  ├──────────► duplicates.py       appearance clusters + burst links → groups
+ ui/ (Rich)          ├──────────► scoring/            PURE functions: metrics → 0-100 scores
+- render, progress   └──────────► curation.py         rank · recommend · best shot
++ render, progress   │                                (technical · landscape · group · subject · composition)
++                    └──────────► curation.py         rank · recommend · best shot per group
+                     reporting.py   organizer.py   model_download.py   doctor.py
+ models.py (typed records)   config.py (validated settings)   imaging.py (single decode path)
+ ```
+@@ -81,6 +82,39 @@ Design rules that keep it modular:
+ Unknown keys are rejected so typos fail loudly. Weights are normalised over the components that
+ actually exist for an image, so disabling or losing the AI model never silently scores it as 0.
+ 
++## Scenes, group photos and bursts
++
++**Landscapes.** A photo is judged as a landscape when the vision model's top content label is
++"landscape" (or, with AI off, when a strong horizon is found) *and* no face is big enough to be
++the subject (`scene.people_min_face_area`). Landscapes then use scenery rules instead of portrait
++rules: exposure from highlight/shadow **clipping** (not mean brightness, which punished sunsets and
++snow), **dynamic range** instead of global contrast, **tiled sharpness** (75th-percentile tile, so
++a crisp scene with empty sky is not "blurry"), and composition from **horizon level** (signed tilt),
++**horizon placement** and the **focal point** (spectral-residual saliency). Subject is excluded from
++the weighted score rather than scored as a neutral 50. A landscape that is out of focus is capped at
++`review` (`thresholds.soft_focus_sharpness`), so good composition cannot rescue it.
++
++**Group photos.** Only *subjects* count: a face must cover `selection.min_face_area` of the frame and
++`selection.relative_face_area` of the largest face, so passers-by are ignored but a distant group is
++still a group. A subject whose eyes are clearly closed (`selection.closed_ear_threshold`; judged only on
++faces big enough to read and not in profile) caps that face and the whole subject score, and caps the
++photo at `review` (`thresholds.closed_eyes_gate`).
++
++**Bursts and best-shot choice.** Capture time comes from EXIF (never file mtime). A frame joins any frame
++within `bursts.max_gap_seconds` that looks continuous with it (`bursts.hamming_threshold`, looser than
++the duplicate threshold), so a panning or moving sequence groups even when its first and last frames
++differ. Groups are labelled `duplicate` (byte-identical), `burst` or `similar`. Within a group frames
++are compared on a *selection score* (final score without the AI component, because AI labels flip
++between near-identical frames) minus a **relative-sharpness** penalty
++(`selection.sharpness_weight`). Within `selection.margin` points of the best, the frame with the fewest
++problems wins (closed eyes, or a subject missing compared with the group's median); outside the margin
++quality wins. Every frame's `selection_reason` says why it was kept or dropped.
++
++All of these thresholds are heuristics chosen without a labelled photo set; see *Known limitations*
++and tune them in `culler.yaml` (`scene`, `selection`, `bursts`, `thresholds`).
++
++Report schema is now **3** (additive). Schema-2 reports still load.
++
+ ## Behaviour changes from v0.1 (deliberate)
+ 
+ | Issue in v0.1 | Now |
+@@ -100,12 +134,24 @@ actually exist for an image, so disabling or losing the AI model never silently
+ ## Known limitations
+ 
+ * Scoring formulas and thresholds are the original heuristics, **not calibrated** on a labelled set.
+-* Composition is face-based: images with no faces get a neutral 50 for subject and composition.
++* Composition is face-based except for landscapes: a photo that is neither (food, objects, architecture)
++  still gets a neutral 50 for subject and composition.
++* Eye state uses an eye-aspect-ratio threshold on MediaPipe landmarks. It is conservative, but it has
++  not been validated across faces, glasses or lighting; a wink is not detected and glare can hide eyes.
++  `closed_ear_threshold` and `closed_eyes_gate` are there to tune or turn it off.
++* Horizon detection finds one dominant, near-level line. Mountains, shorelines at an angle, or
++  reflections can fool it; weak detections (`scene.horizon_min_confidence`) are ignored.
++* Burst grouping needs EXIF capture time. Without it, frames group by appearance alone. A RAW+JPEG
++  pair shot together is grouped like a burst. Bursts are keyed to capture time as written, with no
++  time zone, so two cameras with different clock settings will not link.
+ * MediaPipe landmarks carry no visibility, so that sub-score is a constant 1.0.
+ * Duplicate grouping is O(n²) (vectorised; fine for ~10⁴ images, use an LSH/BK-tree beyond that).
+ * Hashes detect *similar framing*, so a heavily blurred twin of a photo groups with it; that is
+   intentional (the sharper one is picked as representative).
+-* HEIC/RAW are not supported (would need `pillow-heif` / `rawpy`).
++* HEIC/HEIF is decoded through `pillow-heif` (extra `formats`). **Camera RAW is not decoded**: the RAW
++  extensions are scanned, but `rawpy` is not wired into `imaging.load_rgb`. TIFF-based RAW (DNG, NEF,
++  ARW, CR2...) may open through Pillow as a small embedded preview and be scored on that, so keep RAW
++  out of the input folder until that is implemented.
+ 
+ ## Development
+ 
+-- 
+2.43.0
+
