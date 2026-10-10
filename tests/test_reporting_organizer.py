@@ -86,7 +86,7 @@ def test_copy_leaves_sources_and_is_idempotent(report, tmp_path):
     ops = plan_operations(report, dest)
     first = execute(ops, Mode.COPY, dest)
     assert len(first.done) == 3 and all(o.source.exists() and o.destination.exists() for o in ops)
-    assert (dest / ".culler_manifest.json").exists()
+    assert first.journal and first.journal.parent == dest / ".culler" / "undo"
     again = execute(ops, Mode.COPY, dest)
     assert not again.done and {r for _, r in again.skipped} == {"destination exists"}
     assert not list(dest.rglob("*.part"))

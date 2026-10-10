@@ -20,7 +20,7 @@ from media_culler.doctor import run_checks
 from media_culler.exceptions import ConfigError, CullerError
 from media_culler.logging_setup import configure_logging
 from media_culler.model_download import download_file
-from media_culler.organizer import Mode, execute, plan_operations
+from media_culler.organizer import Mode, execute, latest_journal, plan_operations, undo_run
 from media_culler.pipeline import Pipeline
 from media_culler.reporting import build_report, load_report, write_reports
 from media_culler.scanner import scan_directory
@@ -295,6 +295,19 @@ def organize(
             help="Don't route weaker duplicates to similar_alternates/.",
         ),
     ] = False,
+    group_folders: Annotated[
+        bool,
+        typer.Option(
+            "--group-folders",
+            help="Put each burst/duplicate group in its own folder, e.g. select/burst_0007/.",
+        ),
+    ] = False,
+    no_sidecars: Annotated[
+        bool,
+        typer.Option(
+            "--no-sidecars", help="Don't take .xmp/.aae files and Live Photo videos along."
+        ),
+    ] = False,
     apply: Annotated[
         bool, typer.Option("--apply", help="Actually do it. Without this it is a dry run.")
     ] = False,
@@ -317,6 +330,8 @@ def organize(
         destination,
         separate_duplicates=not keep_duplicates_in_place,
         only=set(only) if only else None,
+        include_sidecars=not no_sidecars,
+        group_folders=group_folders,
     )
     if not ops:
         console.print("[warn]Nothing to organize.[/]")
@@ -324,6 +339,15 @@ def organize(
 
     console.print(organize_plan_table(ops))
     console.print(f"[muted]{mode.value} → {destination}[/]")
+    input_root = Path(loaded.input_directory).resolve()
+    if (
+        input_root in destination.resolve().parents
+        and destination.resolve() != settings.paths.output_directory.resolve()
+    ):
+        console.print(
+            "[warn]The destination is inside the scanned folder: a later `culler run` on it "
+            "will pick up the copies too. Use paths.output_directory or a folder outside.[/]"
+        )
     if not apply:
         console.print(
             Panel(
@@ -343,6 +367,8 @@ def organize(
         raise typer.Exit(EXIT_ERROR)
 
     outcome = execute(ops, mode, destination)
+    if outcome.journal:
+        console.print(f"[muted]Undo with: culler undo --dest {destination} --apply[/]")
     console.print(
         f"[ok]{len(outcome.done)} done[/] · {len(outcome.skipped)} skipped · "
         f"[{'fail' if outcome.failed else 'muted'}]{len(outcome.failed)} failed[/]"
@@ -351,6 +377,44 @@ def organize(
         console.print(f"  [muted]{op.source.name}: {reason}[/]")
     if outcome.failed:
         raise typer.Exit(EXIT_ERROR)
+
+
+@app.command()
+def undo(
+    dest: Annotated[
+        Path | None,
+        typer.Option("--dest", "-d", help="Destination root used by organize."),
+    ] = None,
+    journal: Annotated[
+        Path | None, typer.Option("--journal", help="A specific run (default: the latest).")
+    ] = None,
+    apply: Annotated[
+        bool, typer.Option("--apply", help="Actually do it. Without this it is a dry run.")
+    ] = False,
+    config: ConfigOpt = None,
+) -> None:
+    """Reverse the last `organize` run. Dry run by default; never deletes unverified files."""
+    settings = _load(config)
+    console = make_console()
+    destination = dest or settings.paths.output_directory
+    target = journal or latest_journal(destination)
+    if target is None or not target.exists():
+        console.print(f"[warn]No organize run to undo in {destination}.[/]")
+        raise typer.Exit(EXIT_ERROR)
+
+    outcome = undo_run(target, destination, apply=apply)
+    verb = "Reverted" if apply else "Would revert"
+    console.print(f"[ok]{verb} {len(outcome.reverted)}[/] · {len(outcome.skipped)} skipped")
+    for path, reason in outcome.skipped[:10]:
+        console.print(f"  [muted]{path.name}: {reason}[/]")
+    if not apply:
+        console.print(
+            Panel(
+                "Dry run: nothing was changed. Add [bold]--apply[/] to proceed.",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------- models

@@ -188,13 +188,18 @@ def organize_plan_table(ops: list[Operation], limit: int = 15) -> Table:
     table = Table(title=f"Plan ({len(ops)} files)", box=box.SIMPLE_HEAVY, title_justify="left")
     table.add_column("Bucket")
     table.add_column("Count", justify="right")
+    table.add_column("Sidecars", justify="right")
     table.add_column("Size", justify="right")
     buckets: dict[str, list[Operation]] = {}
     for op in ops:
         buckets.setdefault(op.bucket, []).append(op)
     for bucket, items in sorted(buckets.items()):
         style = "similar_alternates" if bucket == DUPLICATES_BUCKET else bucket
+        sidecars = sum(1 for o in items if o.kind == "sidecar")
         table.add_row(
-            Text(bucket, style=style), str(len(items)), human_size(sum(o.size_bytes for o in items))
+            Text(bucket, style=style),
+            str(len(items) - sidecars),
+            str(sidecars) if sidecars else "",
+            human_size(sum(o.size_bytes for o in items)),
         )
     return table
